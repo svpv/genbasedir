@@ -21,7 +21,11 @@
 #include <stdbool.h>
 #include <string.h>
 
-bool usefulFile1(const char *d, size_t dlen, const char *b)
+// Check if a directory from %{DIRNAMES} (i.e. with a trailing slash)
+// is a PATH directory.  Files under such a directory will not be
+// stripped from the header file list.  The function works even when
+// d is not null-terminated and/or when dlen == 0.
+bool bindir(const char *d, size_t dlen)
 {
     // Compare a string to a string literal.
 #define strLen(ss) (sizeof(ss "") - 1)
@@ -30,42 +34,42 @@ bool usefulFile1(const char *d, size_t dlen, const char *b)
 #define startsWith(s, ss) (s##len >= strLen(ss) && memEq(s, ss))
 #define endsWith(s, ss) (s##len >= strLen(ss) && memEq(s + s##len - strLen(ss), ss))
 
-    // Trying to compare only 4-byte and 8-byte pieces.
+    // Trying to compare only 4-byte pieces.
     bool usr = startsWith(d, "/usr");
+    if (usr)
+	d += strLen("/usr"), dlen -= strLen("/usr");
 
-    // Skip /usr/lib/debug/ which has false bindirs, along with /usr/src/debug/.
-    if (usr && dlen >= strLen("/usr/lib/debug/") && memEq(d + 11, "bug/"))
-	if ((memEq(d + 4, "/lib/deb") || memEq(d + 4, "/src/deb")))
-	    return false;
-
-    // PATH-like directories - /bin/ and /sbin/.
     if (endsWith(d, "bin/")) {
 	const char *pre = d + dlen - strLen("/bin/");
-	if (*pre == '/' || memEq(pre - 1, "/s"))
-	    return true;
+	if (*pre == '/') {
+	    // Either /bin/ or /usr/bin/.
+	    if (dlen == strLen("/bin/"))
+		return true;
+	    // Starts with /usr/lib/k*.
+	    if (usr && startsWith(d, "/lib/k"))
+		goto kde;
+	}
+	else if (memEq(pre - 1, "/s")) {
+	    // Either /sbin/ or /usr/sbin/.
+	    if (dlen == strLen("/sbin/"))
+		return true;
+	}
+	return false;
     }
 
-    // Only /usr/share/ and /usr/games/ are left of interest.
-    if (!usr || dlen < strLen("/usr/share/"))
-	return false;
-    if (memEq(d + strLen("/us"), "r/games/"))
+    // The estimable /usr/games/ shall not be forgotten.
+    if (usr && strEq(d, "/games/"))
 	return true;
-    if (memEq(d + strLen("/us"), "r/share/") == false)
-	return false;
-
-    // Handle files under /usr/share/.
-    d += strLen("/usr/share/"), dlen -= strLen("/usr/share/");
-    // Java jars.
-    if (startsWith(d, "java/")) {
-	size_t blen = strlen(b);
-	return endsWith(b, ".jar");
-    }
-    // ttf and otf fonts.
-    if (startsWith(d, "fonts/")) {
-	size_t blen = strlen(b);
-	return endsWith(b, ".ttf") || endsWith(b, ".otf");
-    }
-
+    return false;
+kde:
+    // Handle /usr/lib/k*/bin/, /usr already stripped off.
+    d += strLen("/lib/k"), dlen -= strLen("/lib/k");
+    // Either /usr/lib/kde3/bin/ or /usr/lib/kde4/bin/.
+    if (dlen == strLen("de3/bin/") && memEq(d, "de"))
+	return (unsigned char) d[strLen("de")] - '3' <= 1U;
+    // Either /usr/lib/kf5/bin/ or /usr/lib/kf6/bin/.
+    if (dlen == strLen("f5/bin/") && (memEq(d, "f5") || memEq(d, "f6")))
+	return true;
     return false;
 }
 

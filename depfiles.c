@@ -34,42 +34,20 @@ bool bindir(const char *d, size_t dlen)
 #define startsWith(s, ss) (s##len >= strLen(ss) && memEq(s, ss))
 #define endsWith(s, ss) (s##len >= strLen(ss) && memEq(s + s##len - strLen(ss), ss))
 
-    // Trying to compare only 4-byte pieces.
-    bool usr = startsWith(d, "/usr");
-    if (usr)
-	d += strLen("/usr"), dlen -= strLen("/usr");
-
-    if (endsWith(d, "bin/")) {
-	const char *pre = d + dlen - strLen("/bin/");
-	if (*pre == '/') {
-	    // Either /bin/ or /usr/bin/.
-	    if (dlen == strLen("/bin/"))
-		return true;
-	    // Starts with /usr/lib/k*.
-	    if (usr && startsWith(d, "/lib/k"))
-		goto kde;
-	}
-	else if (memEq(pre - 1, "/s")) {
-	    // Either /sbin/ or /usr/sbin/.
-	    if (dlen == strLen("/sbin/"))
-		return true;
-	}
-	return false;
+    switch (dlen) {
+#define caseStr(ss) case strLen(ss): return memEq(d, ss)
+    caseStr("/bin/");
+    caseStr("/sbin/");
+    caseStr("/usr/bin/");
+    caseStr("/usr/sbin/");
+    caseStr("/usr/games/");
+    case strLen("/usr/lib/kf5/bin/"):
+	return memEq(d, "/usr/lib/kf5/bin/") ||
+	       memEq(d, "/usr/lib/kf6/bin/");
+    case strLen("/usr/lib/kde4/bin/"):
+	return memEq(d, "/usr/lib/kde4/bin/") ||
+	       memEq(d, "/usr/lib/kde3/bin/");
     }
-
-    // The estimable /usr/games/ shall not be forgotten.
-    if (usr && strEq(d, "/games/"))
-	return true;
-    return false;
-kde:
-    // Handle /usr/lib/k*/bin/, /usr already stripped off.
-    d += strLen("/lib/k"), dlen -= strLen("/lib/k");
-    // Either /usr/lib/kde3/bin/ or /usr/lib/kde4/bin/.
-    if (dlen == strLen("de3/bin/") && memEq(d, "de"))
-	return (unsigned char) d[strLen("de")] - '3' <= 1U;
-    // Either /usr/lib/kf5/bin/ or /usr/lib/kf6/bin/.
-    if (dlen == strLen("f5/bin/") && (memEq(d, "f5") || memEq(d, "f6")))
-	return true;
     return false;
 }
 

@@ -236,20 +236,31 @@ void copyStrippedFileList(Header h1, Header h2)
 	if (d == last_dn2)
 	    // The same dirname, the same dirindex.
 	    di2[bnc2] = di2[bnc2-1], bnc2++;
+	else if (bnc2 <= 1) {
+	    // With bnc2 == 0, nothing has been added yet.
+	    // With bnc2 == 1, there's only one dirname that didn't match.
+	    dn2[dnc2] = d;
+	    di2[bnc2++] = dnc2++;
+	    last_dn2 = d;
+	}
 	else {
-	    // See if the directory was already added.
-	    size_t j;
-	    for (j = 0; j < dnc2; j++)
+	    // See if the directory was already added.  Since the last dirname
+	    // didn't match, with bnc2 == 2, only dn2[0] needs to be checked.
+	    size_t j = bnc2 - 2;
+	    while (1) {
 		if (dn2[j] == d) {
 		    di2[bnc2++] = j;
+		    last_dn2 = d;
 		    break;
 		}
-	    // Not found among previously added dirs?
-	    if (j == dnc2) {
-		dn2[dnc2] = d;
-		di2[bnc2++] = dnc2++;
+		if (j == 0) {
+		    dn2[dnc2] = d;
+		    di2[bnc2++] = dnc2++;
+		    last_dn2 = d;
+		    break;
+		}
+		j--;
 	    }
-	    last_dn2 = d;
 	}
     }
     // Put to h2.

@@ -146,4 +146,105 @@ void findDepFiles(Header h)
     // package names.  They should have no effect on filenames.
 }
 
+#include <stdio.h>
+#include <errno.h>
+
+// Read filenames from --useful-files=FILE.
+void readDepFiles(const char *fname, unsigned char delim)
+{
+    FILE *fp = fopen(fname, "r");
+    assert(fp);
+    char *line = NULL;
+    size_t alloc_size = 0;
+    while (1) {
+	errno = 0;
+	ssize_t len = getdelim(&line, &alloc_size, delim, fp);
+	if (len < 0)
+	    break;
+	if (len > 0 && (unsigned char) line[len-1] == delim)
+	    line[--len] = '\0';
+	if (len == 0)
+	    continue;
+	assert(*line == '/');
+	addDepFile(line, len, true);
+    }
+    // Distinguish between EOF and error.
+    assert(errno == 0);
+    free(line);
+    int rc = fclose(fp);
+    assert(rc == 0);
+}
+
+#include <getopt.h>
+#include <fcntl.h>
+
+enum {
+    OPT_BLOAT = 256,
+    OPT_USEFUL_FILES_FROM,
+    OPT_USEFUL_FILES0_FROM,
+};
+
+int bloat;
+
+const struct option longopts[] = {
+    { "help", no_argument, NULL, 'h' },
+    { "bloat", no_argument, &bloat, 1 },
+    { "useful-files", required_argument, NULL, OPT_USEFUL_FILES_FROM },
+    { "useful-files-from", required_argument, NULL, OPT_USEFUL_FILES_FROM },
+    { "useful-files0-from", required_argument, NULL, OPT_USEFUL_FILES0_FROM },
+    { NULL },
+};
+
+int main(int argc, char **argv)
+{
+    const char *argv0 = argv[0];
+#define USEFUL_FILES_MAX 8
+    size_t usefulFilesCount = 0;
+    const char *usefulFilesFrom[USEFUL_FILES_MAX];
+    char usefulFilesDelim[USEFUL_FILES_MAX];
+    int c;
+    while ((c = getopt_long(argc, argv, "h", longopts, NULL)) != -1) {
+	switch (c) {
+	case 0:
+	    break;
+	case OPT_USEFUL_FILES_FROM:
+	    if (usefulFilesCount < USEFUL_FILES_MAX) {
+		usefulFilesFrom[usefulFilesCount] = optarg,
+		usefulFilesDelim[usefulFilesCount] = '\n';
+	    }
+	    usefulFilesCount++;
+	    break;
+	case OPT_USEFUL_FILES0_FROM:
+	    if (usefulFilesCount < USEFUL_FILES_MAX) {
+		usefulFilesFrom[usefulFilesCount] = optarg,
+		usefulFilesDelim[usefulFilesCount] = '\0';
+	    }
+	    usefulFilesCount++;
+	    break;
+	default:
+	    fprintf(stderr, "Usage: %s [OPTIONS...] [ARGS...]\n", argv0);
+	    return 1;
+	}
+    }
+
+    argc -= optind, argv += optind;
+
+    if (usefulFilesCount) {
+	if (bloat)
+	    fprintf(stderr, "%s: --useful-files redundant with --bloat\n", argv0);
+	else if (usefulFilesCount > USEFUL_FILES_MAX) {
+	    fprintf(stderr, "%s: too may --useful-files options\n", argv0);
+	    return 1;
+	}
+	else {
+	    depFiles = fpset_new(10);
+	    assert(depFiles);
+	    for (size_t i = 0; i < usefulFilesCount; i++)
+		readDepFiles(usefulFilesFrom[i], usefulFilesDelim[i]);
+	}
+    }
+
+    return 0;
+}
+
 // ex:set ts=8 sts=4 sw=4 noet:

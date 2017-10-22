@@ -146,6 +146,126 @@ void findDepFiles(Header h)
     // package names.  They should have no effect on filenames.
 }
 
+// Check if a file from %{FILENAMES} is in the set of depFiles.  This does not
+// include the check for bindir, which can be implemented much more efficiently
+// to handle the case when a few adjacent files are under the same dir.
+bool depFile(const char *d, size_t dlen, const char *b)
+{
+    // Whether depFiles are needed at all is decided in main().
+    if (!depFiles)
+	return false;
+    size_t blen = strlen(b);
+    // Filenames must not exceed PATH_MAX.  Even if the limit gets increased
+    // or lifted (possibly only for some filesystems), the change shouldn't
+    // spread here without consideration.
+    assert(dlen + blen < 4096);
+    // Construct the full filename; no need to null-terminate.
+    char fname[dlen + blen];
+    memcpy(fname, d, dlen);
+    memcpy(fname + dlen, b, blen);
+    // Check the fingerprint.
+    uint64_t fp = hash64(fname, dlen + blen);
+    return fpset_has(depFiles, fp);
+}
+
+#include <stdlib.h>
+#define xmalloc malloc
+
+// Copy useful files from h1 to h2.
+void copyStrippedFileList(Header h1, Header h2)
+{
+    // Load data from h1.
+    struct rpmtd_s td_bn, td_dn, td_di;
+    int rc = headerGet(h1, RPMTAG_BASENAMES, &td_bn, HEADERGET_MINMEM);
+    if (rc != 1)
+	return;
+    assert(td_bn.type == RPM_STRING_ARRAY_TYPE);
+    assert(td_bn.count > 0);
+    rc = headerGet(h1, RPMTAG_DIRNAMES, &td_dn, HEADERGET_MINMEM);
+    assert(rc == 1);
+    assert(td_dn.type == RPM_STRING_ARRAY_TYPE);
+    assert(td_dn.count > 0);
+    assert(td_dn.count <= td_bn.count);
+    rc = headerGet(h1, RPMTAG_DIRINDEXES, &td_di, HEADERGET_MINMEM);
+    assert(rc == 1);
+    assert(td_di.type == RPM_INT32_TYPE);
+    assert(td_di.count == td_bn.count);
+    // Initialize (from -> to) arrays.
+    const char **bn1 = td_bn.data, **bn2 = NULL;
+    const char **dn1 = td_dn.data, **dn2 = NULL;
+    unsigned *di1 = td_di.data, *di2 = NULL;
+    size_t bnc1 = td_bn.count, bnc2 = 0;
+    size_t dnc1 = td_di.count, dnc2 = 0;
+    // Current directory.
+    const char *d = NULL;
+    size_t dlen = 0;
+    // If the current file is under bindir.
+    bool bin = false;
+    // From the previous iteration.
+    size_t last_di1 = (size_t) -1;
+    const char *last_dn2 = NULL;
+    // Run the copy loop.
+    for (size_t i = 0; i < bnc1; i++) {
+	// Load dir.
+	if (di1[i] != last_di1) {
+	    size_t di = last_di1 = di1[i];
+	    assert(di < dnc1);
+	    d = dn1[di];
+	    dlen = strlen(d);
+	    bin = bindir(d, dlen);
+	}
+	// Not a useful file?
+	const char *b = bn1[i];
+	if (!bin && !depFile(d, dlen, b))
+	    continue;
+	// Allocate arrays for h2.
+	if (!bn2) {
+	    // Will need at most that many basenames and dirindexes.
+	    // There is no reduced estimate for dirnames, though.
+	    size_t n = bnc1 - i;
+	    // Allocate in a single chunk.
+	    bn2 = xmalloc(n * (sizeof(*bn2) + sizeof(*di2)) + dnc1 * sizeof(*dn2));
+	    // Place dirnames right after basenames, to keep the pointers aligned.
+	    dn2 = bn2 + n;
+	    // Dirindexes are 32-bit integers, need less alignment than dirnames.
+	    di2 = (unsigned *) (dn2 + dnc1);
+	}
+	// Put basename; bnc2 gets increased when dirindex is added.
+	bn2[bnc2] = b;
+	// Deal with dirname and dirindex.
+	if (d == last_dn2)
+	    // The same dirname, the same dirindex.
+	    di2[bnc2] = di2[bnc2-1], bnc2++;
+	else {
+	    // See if the directory was already added.
+	    size_t j;
+	    for (j = 0; j < dnc2; j++)
+		if (dn2[j] == d) {
+		    di2[bnc2++] = j;
+		    break;
+		}
+	    // Not found among previously added dirs?
+	    if (j == dnc2) {
+		dn2[dnc2] = d;
+		di2[bnc2++] = dnc2++;
+	    }
+	    last_dn2 = d;
+	}
+    }
+    // Put to h2.
+    if (bn2) {
+	headerPutStringArray(h2, RPMTAG_BASENAMES, bn2, bnc2);
+	headerPutStringArray(h2, RPMTAG_DIRNAMES, dn2, dnc2);
+	headerPutUint32(h2, RPMTAG_DIRINDEXES, di2, bnc2);
+	// Arrays were allocated in a single chunk.
+	free(bn2);
+    }
+    // Dispose of h1 data.
+    rpmtdFreeData(&td_bn);
+    rpmtdFreeData(&td_dn);
+    rpmtdFreeData(&td_di);
+}
+
 #include <stdio.h>
 #include <errno.h>
 

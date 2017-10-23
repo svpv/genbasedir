@@ -25,7 +25,7 @@
 // is a PATH directory.  Files under such a directory will not be
 // stripped from the header file list.  The function works even when
 // d is not null-terminated and/or when dlen == 0.
-bool bindir(const char *d, size_t dlen)
+static bool bindir(const char *d, size_t dlen)
 {
     // Compare a string to a string literal.
 #define strLen(ss) (sizeof(ss "") - 1)
@@ -58,7 +58,7 @@ bool bindir(const char *d, size_t dlen)
 
 // The hash function which is used for fingerprinting.
 // I wasn't able to compile the ifunc variant with AES-NI just yet.
-uint64_t hash64(const void *data, size_t size)
+static uint64_t hash64(const void *data, size_t size)
 {
 #if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
     return t1ha1_be(data, size, 0);
@@ -71,8 +71,8 @@ uint64_t hash64(const void *data, size_t size)
 // a probabilistic data structure for approximate membership queries.
 // In the worst case (which in a typical setting is highly unlikely)
 // an unrelated filename can be preserved in the output on behalf of
-// filename dependencies.  Initialized in main().
-struct fpset *depFiles;
+// filename dependencies.
+static struct fpset *depFiles;
 
 // Add a filename dependency (which must start with a slash) to depFiles.
 // When the dependency comes from a header, its length is unknown; otherwise,
@@ -104,7 +104,7 @@ static inline void addDepFile(const char *dep, size_t len, bool hasLen)
 }
 
 // Process filename dependencies from a specific tag.
-bool findDepFiles1(Header h, int tag)
+static bool findDepFiles1(Header h, int tag)
 {
     struct rpmtd_s td;
     int rc = headerGet(h, tag, &td, HEADERGET_MINMEM);
@@ -120,11 +120,41 @@ bool findDepFiles1(Header h, int tag)
     return true;
 }
 
+// Check if a file from %{FILENAMES} is in the set of depFiles.  This does not
+// include the check for bindir, which can be implemented much more efficiently
+// to handle the case when a few adjacent files are under the same dir.
+static bool depFile(const char *d, size_t dlen, const char *b)
+{
+    // No depfiles added?
+    if (!depFiles)
+	return false;
+    size_t blen = strlen(b);
+    // Filenames must not exceed PATH_MAX.  Even if the limit gets increased
+    // or lifted (possibly only for some filesystems), the change shouldn't
+    // spread here without consideration.
+    assert(dlen + blen < 4096);
+    // Construct the full filename; no need to null-terminate.
+    char fname[dlen + blen];
+    memcpy(fname, d, dlen);
+    memcpy(fname + dlen, b, blen);
+    // Check the fingerprint.
+    uint64_t fp = hash64(fname, dlen + blen);
+    return fpset_has(depFiles, fp);
+}
+
+// The API starts here.
+#include "depfiles.h"
+
 // Retrieve filename dependencies from tags like %{REQUIRENAME} and store them
 // in depFiles.  Later in the second pass, each filename from %{FILENAMES} will
 // be tested against the set of depFiles and possibly preserved in the output.
 void findDepFiles(Header h)
 {
+    // Initialize depFiles.
+    if (!depFiles) {
+	depFiles = fpset_new(10);
+	assert(depFiles);
+    }
     // Empty Requires are not permitted - someplace, they check
     // for the "rpmlib(PayloadIsLzma)" dependency as mandatory.
     bool hasReq = findDepFiles1(h, RPMTAG_REQUIRENAME);
@@ -144,28 +174,6 @@ void findDepFiles(Header h)
     findDepFiles1(h, RPMTAG_CONFLICTNAME);
     // Obsoletes should not be processed - they only work against
     // package names.  They should have no effect on filenames.
-}
-
-// Check if a file from %{FILENAMES} is in the set of depFiles.  This does not
-// include the check for bindir, which can be implemented much more efficiently
-// to handle the case when a few adjacent files are under the same dir.
-bool depFile(const char *d, size_t dlen, const char *b)
-{
-    // Whether depFiles are needed at all is decided in main().
-    if (!depFiles)
-	return false;
-    size_t blen = strlen(b);
-    // Filenames must not exceed PATH_MAX.  Even if the limit gets increased
-    // or lifted (possibly only for some filesystems), the change shouldn't
-    // spread here without consideration.
-    assert(dlen + blen < 4096);
-    // Construct the full filename; no need to null-terminate.
-    char fname[dlen + blen];
-    memcpy(fname, d, dlen);
-    memcpy(fname + dlen, b, blen);
-    // Check the fingerprint.
-    uint64_t fp = hash64(fname, dlen + blen);
-    return fpset_has(depFiles, fp);
 }
 
 #include <stdlib.h>
@@ -283,6 +291,11 @@ void copyStrippedFileList(Header h1, Header h2)
 // Read filenames from --useful-files=FILE.
 void readDepFiles(const char *fname, unsigned char delim)
 {
+    // Initialize depFiles.
+    if (!depFiles) {
+	depFiles = fpset_new(10);
+	assert(depFiles);
+    }
     FILE *fp = fopen(fname, "r");
     assert(fp);
     char *line = NULL;
@@ -304,78 +317,6 @@ void readDepFiles(const char *fname, unsigned char delim)
     free(line);
     int rc = fclose(fp);
     assert(rc == 0);
-}
-
-#include <getopt.h>
-#include <fcntl.h>
-
-enum {
-    OPT_BLOAT = 256,
-    OPT_USEFUL_FILES_FROM,
-    OPT_USEFUL_FILES0_FROM,
-};
-
-int bloat;
-
-const struct option longopts[] = {
-    { "help", no_argument, NULL, 'h' },
-    { "bloat", no_argument, &bloat, 1 },
-    { "useful-files", required_argument, NULL, OPT_USEFUL_FILES_FROM },
-    { "useful-files-from", required_argument, NULL, OPT_USEFUL_FILES_FROM },
-    { "useful-files0-from", required_argument, NULL, OPT_USEFUL_FILES0_FROM },
-    { NULL },
-};
-
-int main(int argc, char **argv)
-{
-    const char *argv0 = argv[0];
-#define USEFUL_FILES_MAX 8
-    size_t usefulFilesCount = 0;
-    const char *usefulFilesFrom[USEFUL_FILES_MAX];
-    char usefulFilesDelim[USEFUL_FILES_MAX];
-    int c;
-    while ((c = getopt_long(argc, argv, "h", longopts, NULL)) != -1) {
-	switch (c) {
-	case 0:
-	    break;
-	case OPT_USEFUL_FILES_FROM:
-	    if (usefulFilesCount < USEFUL_FILES_MAX) {
-		usefulFilesFrom[usefulFilesCount] = optarg,
-		usefulFilesDelim[usefulFilesCount] = '\n';
-	    }
-	    usefulFilesCount++;
-	    break;
-	case OPT_USEFUL_FILES0_FROM:
-	    if (usefulFilesCount < USEFUL_FILES_MAX) {
-		usefulFilesFrom[usefulFilesCount] = optarg,
-		usefulFilesDelim[usefulFilesCount] = '\0';
-	    }
-	    usefulFilesCount++;
-	    break;
-	default:
-	    fprintf(stderr, "Usage: %s [OPTIONS...] [ARGS...]\n", argv0);
-	    return 1;
-	}
-    }
-
-    argc -= optind, argv += optind;
-
-    if (usefulFilesCount) {
-	if (bloat)
-	    fprintf(stderr, "%s: --useful-files redundant with --bloat\n", argv0);
-	else if (usefulFilesCount > USEFUL_FILES_MAX) {
-	    fprintf(stderr, "%s: too may --useful-files options\n", argv0);
-	    return 1;
-	}
-	else {
-	    depFiles = fpset_new(10);
-	    assert(depFiles);
-	    for (size_t i = 0; i < usefulFilesCount; i++)
-		readDepFiles(usefulFilesFrom[i], usefulFilesDelim[i]);
-	}
-    }
-
-    return 0;
 }
 
 // ex:set ts=8 sts=4 sw=4 noet:

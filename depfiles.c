@@ -142,6 +142,12 @@ static bool depFile(const char *d, size_t dlen, const char *b)
     return fpset_has(depFiles, fp);
 }
 
+// Called upon exit.
+static __attribute__((destructor)) void freeDepFiles(void)
+{
+    fpset_free(depFiles);
+}
+
 // The API starts here.
 #include "depfiles.h"
 

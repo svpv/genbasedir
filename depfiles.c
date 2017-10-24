@@ -183,7 +183,7 @@ void findDepFiles(Header h)
 }
 
 #include <stdlib.h>
-#define xmalloc malloc
+#include "errexit.h"
 
 // Copy useful files from h1 to h2.
 void copyStrippedFileList(Header h1, Header h2)
@@ -303,7 +303,8 @@ void readDepFiles(const char *fname, unsigned char delim)
 	assert(depFiles);
     }
     FILE *fp = fopen(fname, "r");
-    assert(fp);
+    if (!fp)
+	die("%s: %m", fname);
     char *line = NULL;
     size_t alloc_size = 0;
     while (1) {
@@ -315,14 +316,17 @@ void readDepFiles(const char *fname, unsigned char delim)
 	    line[--len] = '\0';
 	if (len == 0)
 	    continue;
-	assert(*line == '/');
+	// Permit comments.
+	if (*line == '#' && delim == '\n')
+	    continue;
+	if (*line != '/')
+	    die("%s: bad input", fname);
 	addDepFile(line, len, true);
     }
     // Distinguish between EOF and error.
     assert(errno == 0);
     free(line);
-    int rc = fclose(fp);
-    assert(rc == 0);
+    fclose(fp);
 }
 
 // ex:set ts=8 sts=4 sw=4 noet:

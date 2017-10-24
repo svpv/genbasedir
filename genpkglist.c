@@ -22,6 +22,7 @@
 
 #include <getopt.h>
 #include <fcntl.h>
+#include "errexit.h"
 
 enum {
     OPT_BLOAT = 256,
@@ -42,7 +43,6 @@ static const struct option longopts[] = {
 
 int main(int argc, char **argv)
 {
-    const char *argv0 = argv[0];
 #define USEFUL_FILES_MAX 8
     size_t usefulFilesCount = 0;
     const char *usefulFilesFrom[USEFUL_FILES_MAX];
@@ -67,7 +67,7 @@ int main(int argc, char **argv)
 	    usefulFilesCount++;
 	    break;
 	default:
-	    fprintf(stderr, "Usage: %s [OPTIONS...] [ARGS...]\n", argv0);
+	    fprintf(stderr, "Usage: %s [OPTIONS...] [ARGS...]\n", PROG);
 	    return 1;
 	}
     }
@@ -76,11 +76,9 @@ int main(int argc, char **argv)
 
     if (usefulFilesCount) {
 	if (bloat)
-	    fprintf(stderr, "%s: --useful-files redundant with --bloat\n", argv0);
-	else if (usefulFilesCount > USEFUL_FILES_MAX) {
-	    fprintf(stderr, "%s: too may --useful-files options\n", argv0);
-	    return 1;
-	}
+	    warn("--useful-files redundant with --bloat");
+	else if (usefulFilesCount > USEFUL_FILES_MAX)
+	    die("too may --useful-files options");
 	else {
 	    for (size_t i = 0; i < usefulFilesCount; i++)
 		readDepFiles(usefulFilesFrom[i], usefulFilesDelim[i]);

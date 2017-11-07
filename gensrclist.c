@@ -64,10 +64,13 @@ static void loadDir(int dirfd)
 #include <limits.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/stat.h>
+#include "prevout.h"
 #include "errexit.h"
 
 enum {
     OPT_FLAT = 256,
+    OPT_PREV_OUT,
 };
 
 static int flat;
@@ -75,15 +78,20 @@ static int flat;
 static const struct option longopts[] = {
     { "help", no_argument, NULL, 'h' },
     { "flat", no_argument, &flat, 1 },
+    { "use-prev-output", required_argument, NULL, OPT_PREV_OUT },
     { NULL },
 };
 
 int main(int argc, char **argv)
 {
     int c;
+    const char *prevout_from = NULL;
     while ((c = getopt_long(argc, argv, "h", longopts, NULL)) != -1) {
 	switch (c) {
 	case 0:
+	    break;
+	case OPT_PREV_OUT:
+	    prevout_from = optarg;
 	    break;
 	default:
 usage:	    fprintf(stderr, "Usage: %s [OPTIONS...] [ARGS...]\n", PROG);
@@ -95,6 +103,9 @@ usage:	    fprintf(stderr, "Usage: %s [OPTIONS...] [ARGS...]\n", PROG);
 	warn("not enough arguments");
 	goto usage;
     }
+
+    // Open previous output.
+    struct prevout *prevout = prevout_from ? prevout_open(prevout_from) : NULL;
 
     // Open the repo dir.  I don't want to mess with snprintf or strcat
     // to make full paths, I would rather use openat(2) with dirfd.
@@ -139,6 +150,32 @@ usage:	    fprintf(stderr, "Usage: %s [OPTIONS...] [ARGS...]\n", PROG);
     // Load srpms (srpmdirfd will be closed).
     loadDir(srpmdirfd);
 
+    // The main loop.
+    for (size_t i = 0; i < nsrpm; i++) {
+	const char *srpm = srpms[i];
+	void *blob = NULL;
+	size_t blobSize = 0;
+	if (prevout) {
+	    struct prevhdr *h = prevout_find_src(prevout, srpm);
+	    if (h) {
+		struct stat st;
+		int rc = stat(srpm, &st);
+		if (rc < 0)
+		    die("%s: %m", srpm);
+		if (h->fsize != (unsigned) st.st_size)
+		    die("%s: file size mismatch", srpm);
+		blob = h->blob, h->blob = NULL;
+		blobSize = h->blobSize;
+	    }
+	}
+	if (!blob) {
+	    // TODO: load the blob.
+	}
+	// TODO: wirte the blob.
+	free(blob);
+    }
+
+    prevout_close(prevout);
     return 0;
 }
 

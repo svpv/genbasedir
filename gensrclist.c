@@ -132,7 +132,11 @@ usage:	    fprintf(stderr, "Usage: %s [OPTIONS...] [ARGS...]\n", PROG);
     // Repo dirfd no longer needed.
     close(dirfd);
 
-    // Load srpms.
+    // Chdir to SRPMS.comp.
+    if (fchdir(srpmdirfd) < 0)
+	die("%s/%s: %m", dir, srpmdir);
+
+    // Load srpms (srpmdirfd will be closed).
     loadDir(srpmdirfd);
 
     return 0;

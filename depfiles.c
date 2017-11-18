@@ -104,7 +104,7 @@ static inline void addDepFile(const char *dep, size_t len, bool hasLen)
 }
 
 // Process filename dependencies from a specific tag.
-static bool findDepFiles1(Header h, int tag)
+static bool findDepFilesH1(Header h, int tag)
 {
     struct rpmtd_s td;
     int rc = headerGet(h, tag, &td, HEADERGET_MINMEM);
@@ -118,6 +118,64 @@ static bool findDepFiles1(Header h, int tag)
 	    addDepFile(deps[i], 0, false);
     rpmtdFreeData(&td);
     return true;
+}
+
+#include <arpa/inet.h>
+
+// Raw header entry, network byte order.
+struct ent { int tag, type, off, cnt; };
+
+// A counterpart to findDepFilesH1 that can process raw blob entries,
+// without loading the header with headerImport().
+static void findDepFilesB1(struct ent *e, char *data, unsigned dl)
+{
+    // Note that htonl(const) won't require actual runtime conversion.
+    // This is one reason why specialized parsing outperforms general
+    // header loading with regionSwab() etc.
+    assert(e->type == htonl(RPM_STRING_ARRAY_TYPE));
+    // Determine argz, the start of the string array.
+    unsigned off = ntohl(e->off);
+    assert(off < dl);
+    const char *argz = data + off;
+    // Use the next entry to find out the end of the string array.
+    unsigned off1 = ntohl(e[1].off);
+    assert(off1 < dl);
+    assert(off1 > off);
+    char *end = data + off1;
+    assert(end[-1] == '\0');
+    // Install the sentinel for rawmemchr.
+    char save = *end;
+    *end = '/';
+    // Instead of iterating each name, the loop tries to iterate only the names
+    // that start with a slash.  This is another reason why specialized parsing
+    // is much more efficient.
+    do {
+	// Iterations start at the beginning of a name.
+	if (*argz == '/') {
+	    size_t len = 1 + strlen(argz + 1);
+	    addDepFile(argz, len, true);
+	    argz += len + 1;
+	}
+	else {
+	    // The name doesn't start with a slash, so try to jump to a goddamn
+	    // slash.  Only about 13% of Requires+Provides names have a slash.
+	    // So this should effectively skip a few names at a time, on average.
+	    argz = rawmemchr(argz + 1, '/');
+	    if (argz == end)
+		break;
+	    size_t len = 1 + strlen(argz + 1);
+	    // Check if the slash is at the beginning of a name.
+	    if (argz[-1] == '\0')
+		addDepFile(argz, len, true);
+	    argz += len + 1;
+	    // When the length isn't needed for addDepFile, it might be
+	    // tempting to try and jump right to the next slash.  However,
+	    // in the presence of dependencies like "perl(Net/DNS/RR/A.pm)",
+	    // it's not a clear win.
+	}
+    } while (argz < end);
+    // Restore the byte clobbered by the sentinel.
+    *end = save;
 }
 
 // Check if a file from %{FILENAMES} is in the set of depFiles.  This does not
@@ -142,6 +200,15 @@ static bool depFile(const char *d, size_t dlen, const char *b)
     return fpset_has(depFiles, fp);
 }
 
+// Called by the routines that add depFiles.
+static void initDepFiles(void)
+{
+    if (!depFiles) {
+	depFiles = fpset_new(10);
+	assert(depFiles);
+    }
+}
+
 // Called upon exit.
 static __attribute__((destructor)) void freeDepFiles(void)
 {
@@ -154,16 +221,12 @@ static __attribute__((destructor)) void freeDepFiles(void)
 // Retrieve filename dependencies from tags like %{REQUIRENAME} and store them
 // in depFiles.  Later in the second pass, each filename from %{FILENAMES} will
 // be tested against the set of depFiles and possibly preserved in the output.
-void findDepFiles(Header h)
+void findDepFilesH(Header h)
 {
-    // Initialize depFiles.
-    if (!depFiles) {
-	depFiles = fpset_new(10);
-	assert(depFiles);
-    }
+    initDepFiles();
     // Empty Requires are not permitted - someplace, they check
     // for the "rpmlib(PayloadIsLzma)" dependency as mandatory.
-    bool hasReq = findDepFiles1(h, RPMTAG_REQUIRENAME);
+    bool hasReq = findDepFilesH1(h, RPMTAG_REQUIRENAME);
     assert(hasReq);
     // If some package Provides a file, but perhaps no package Requires
     // the file yet, we still want to keep the name in all other packages,
@@ -174,12 +237,44 @@ void findDepFiles(Header h)
     // considered an alternative-like virtual path and handled differently
     // by some rpmbuild dependency generators.
     // Provides are mandatory too, due to "Provides: %name = %EVR".
-    bool hasProv = findDepFiles1(h, RPMTAG_PROVIDENAME);
+    bool hasProv = findDepFilesH1(h, RPMTAG_PROVIDENAME);
     assert(hasProv);
     // Conflicts are optional.
-    findDepFiles1(h, RPMTAG_CONFLICTNAME);
+    findDepFilesH1(h, RPMTAG_CONFLICTNAME);
     // Obsoletes should not be processed - they only work against
     // package names.  They should have no effect on filenames.
+}
+
+// A findDepFilesH counterpart which can process raw header blobs.
+void findDepFilesB(const void *blob, size_t blobSize)
+{
+    initDepFiles();
+    unsigned il = ntohl(*((unsigned *) blob + 0));
+    unsigned dl = ntohl(*((unsigned *) blob + 1));
+    assert(8 + 16 * il + dl == blobSize);
+    // The blob starts with these "index entries", followed by data.
+    struct ent *ee = (void *) ((char *) blob + 8);
+    void *data = ee + il;
+    // Below we probe ee[19], for which B1 will probe [20].
+    assert(il > 20);
+    // ProvideName is normally at [13] or at [14], due to Epoch.
+    struct ent *e = &ee[13];
+    if (e->tag != htonl(RPMTAG_PROVIDENAME)) {
+	e++;
+	assert(e->tag == htonl(RPMTAG_PROVIDENAME));
+    }
+    findDepFilesB1(e, data, dl);
+    // RequireName follows ProvideName and RequireFlags.
+    e += 2;
+    assert(e->tag == htonl(RPMTAG_REQUIRENAME));
+    findDepFilesB1(e, data, dl);
+    // ConflictName follows RequireName, RequireVersion, and ConflictFlags.
+    // Conflicts are optional, though.
+    e += 3;
+    if (e->tag != htonl(RPMTAG_CONFLICTNAME))
+	assert(ntohl(e->tag) > RPMTAG_CONFLICTNAME);
+    else
+	findDepFilesB1(e, data, dl);
 }
 
 #include <stdlib.h>
@@ -297,11 +392,7 @@ void copyStrippedFileList(Header h1, Header h2)
 // Read filenames from --useful-files=FILE.
 void readDepFiles(const char *fname, unsigned char delim)
 {
-    // Initialize depFiles.
-    if (!depFiles) {
-	depFiles = fpset_new(10);
-	assert(depFiles);
-    }
+    initDepFiles();
     FILE *fp = fopen(fname, "r");
     if (!fp)
 	die("%s: %m", fname);

@@ -58,12 +58,12 @@ static bool bindir(const char *d, size_t dlen)
 
 // The hash function which is used for fingerprinting.
 // I wasn't able to compile the ifunc variant with AES-NI just yet.
-static uint64_t hash64(const void *data, size_t size)
+static uint64_t hash64(const void *data, size_t size, uint64_t seed)
 {
 #if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-    return t1ha1_be(data, size, 0);
+    return t1ha1_be(data, size, seed);
 #else
-    return t1ha1_le(data, size, 0);
+    return t1ha1_le(data, size, seed);
 #endif
 }
 
@@ -97,10 +97,19 @@ static inline void addDepFile(const char *dep, size_t len, bool hasLen)
 	len = dlen + strlen(rslash + 1);
     if (dep[len-1] == ')')
 	return;
-    // Add the fingerprint.
-    uint64_t fp = hash64(dep, len);
-    int ret = fpset_add(depFiles, fp);
-    assert(ret >= 0);
+    // Add the fingerprint for the dir.  Later we check if the dir was added
+    // and otherwise skip all the files under the dir.
+    uint64_t fp = hash64(dep, dlen, 0);
+    int rc = fpset_add(depFiles, fp);
+    assert(rc >= 0);
+    // Add the fingerprint for the dir+name.  Only the filename is actually
+    // hashed, while the dir hash is used as the seed.  Note that, with this
+    // hashing scheme, dir and dir+name hashes fall under kind of two different
+    // domains.  We might as well use two separate fpsets, which seems redunant
+    // given that we have (at the time of writing) 2070 depfiles under 429 dirs.
+    fp = hash64(dep + dlen, len - dlen, fp);
+    rc = fpset_add(depFiles, fp);
+    assert(rc >= 0);
 }
 
 // Process filename dependencies from a specific tag.
@@ -178,25 +187,128 @@ static void findDepFilesB1(struct ent *e, char *data, unsigned dl)
     *end = save;
 }
 
-// Check if a file from %{FILENAMES} is in the set of depFiles.  This does not
-// include the check for bindir, which can be implemented much more efficiently
-// to handle the case when a few adjacent files are under the same dir.
-static bool depFile(const char *d, size_t dlen, const char *b)
+// So far we have implemented some helpers to collect filename-like
+// dependencies.  We now shift gears to tackle the next stage - sifting
+// the full list of filenames through the bindir and depFiles filter.
+// We want to take advantage of the fact that filenames come in
+// (Basenames,Dirnames,Dirindexes) triples, where Dirnames are unique.
+// Each dirname has a few files under it (10 on average, with SD > 100).
+// Therefore, as the very first step, we classify the directories:
+// D_SKIP means that there are no useful files under the directory;
+// D_BIN indicates a PATH-like directory, hence all filenames under
+// the dir should be preserved unconditionally; D_CHECK means that files
+// under the dir are eligible for inclusion, subject to per-file check.
+enum dirNeed { D_SKIP, D_BIN, D_CHECK };
+
+// Single dir info from a header.
+struct dirInfoH {
+    // Whether the dir is needed.
+    enum dirNeed need;
+    // The info is loaded for each dirname[i].  If the dir makes it to
+    // the output triple, its index in the output is dj (otherwise -1).
+    unsigned dj;
+    // Dirname hash, for D_CHECK.
+    uint64_t fp;
+};
+
+// Single dir info, header blob version.
+struct dirInfoB {
+    // Exactly the same as dirInfoH.
+    enum dirNeed need;
+    unsigned dj;
+    uint64_t fp;
+    // Additionally stores name offset and length.
+    unsigned off, len;
+};
+
+// Load single dir info, header version.  Returns true if the dir is useful.
+static bool makeDirInfoH1(struct dirInfoH *d, const char *dn, size_t dlen)
 {
-    // No depfiles added?
-    if (!depFiles)
-	return false;
-    size_t blen = strlen(b);
-    // Filenames must not exceed PATH_MAX.  Even if the limit gets increased
-    // or lifted (possibly only for some filesystems), the change shouldn't
-    // spread here without consideration.
-    assert(dlen + blen < 4096);
-    // Construct the full filename; no need to null-terminate.
-    char fname[dlen + blen];
-    memcpy(fname, d, dlen);
-    memcpy(fname + dlen, b, blen);
-    // Check the fingerprint.
-    uint64_t fp = hash64(fname, dlen + blen);
+    d->dj = (unsigned) -1;
+    if (bindir(dn, dlen))
+	return d->need = D_BIN, true;
+    // Note that depFiles is checked here, so there's no need to check
+    // depFiles later when iterating filenames.
+    if (depFiles) {
+	uint64_t fp = hash64(dn, dlen, 0);
+	if (fpset_has(depFiles, fp))
+	    return d->fp = fp, d->need = D_CHECK, true;
+    }
+    return d->need = D_SKIP, false;
+}
+
+// Load single dir info, header blob version.
+static bool makeDirInfoB1(struct dirInfoB *d, const char *dn, size_t dlen)
+{
+    // Sort of a polymorphic call.
+    return makeDirInfoH1((struct dirInfoH *) d, dn, dlen);
+}
+
+#include "errexit.h" // xmalloc
+
+// Most packages have only a few dirnames.
+// Preallocate a small dirInfo array, to cut down on malloc calls.
+static union { struct dirInfoH H[24]; struct dirInfoB B[16]; } dirInfoBuf;
+// Should waste no memory in either case.
+static_assert(sizeof dirInfoBuf.H == sizeof dirInfoBuf.B, "dirInfoBuf size");
+
+// Load dir info given dn[n] from a header.
+static struct dirInfoH *makeDirInfoH(const char **dn, size_t n)
+{
+    struct dirInfoH *dinfo = dirInfoBuf.H;
+    if (n > sizeof dirInfoBuf.H / sizeof *dirInfoBuf.H)
+	dinfo = xmalloc(n * sizeof *dinfo);
+    bool need = false;
+    for (size_t i = 0; i < n; i++)
+	need |= makeDirInfoH1(&dinfo[i], dn[i], strlen(dn[i]));
+    // Returns NULL if there are no useful dirs.
+    if (!need) {
+	if (dinfo != dirInfoBuf.H)
+	    free(dinfo);
+	return NULL;
+    }
+    return dinfo;
+}
+
+// Load dir info given a raw header blob entry.
+static struct dirInfoB *makeDirInfoB(struct ent *e, size_t n, char *data, unsigned dl)
+{
+    struct dirInfoB *dinfo = dirInfoBuf.B;
+    if (n > sizeof dirInfoBuf.B / sizeof *dirInfoBuf.B)
+	dinfo = xmalloc(n * sizeof *dinfo);
+    // Determine argz, the start of the string array.
+    unsigned off = ntohl(e->off);
+    assert(off < dl);
+    const char *argz = data + off;
+    // Use the next entry to find out the end of the string array.
+    unsigned off1 = ntohl(e[1].off);
+    assert(off1 < dl);
+    assert(off1 > off);
+    char *end = data + off1;
+    assert(end[-1] == '\0');
+    // Similar to makeDirInfoH.
+    bool need = false;
+    for (size_t i = 0; i < n; i++) {
+	assert(argz < end);
+	struct dirInfoB *d = &dinfo[i];
+	size_t len = strlen(argz);
+	need |= makeDirInfoB1(d, argz, len);
+	d->off = argz - data, d->len = len;
+	argz += len + 1;
+    }
+    if (!need) {
+	if (dinfo != dirInfoBuf.B)
+	    free(dinfo);
+	return NULL;
+    }
+    return dinfo;
+}
+
+// Check if a file from %{FILENAMES} is in the set of depFiles.
+// Assumes that the dir is D_CHECK and its hash is dirfp.
+static bool depFile(uint64_t dirfp, const char *b)
+{
+    uint64_t fp = hash64(b, strlen(b), dirfp);
     return fpset_has(depFiles, fp);
 }
 
@@ -277,24 +389,29 @@ void findDepFilesB(const void *blob, size_t blobSize)
 	findDepFilesB1(e, data, dl);
 }
 
-#include <stdlib.h>
-#include "errexit.h"
-
 // Copy useful files from h1 to h2.
 void copyStrippedFileList(Header h1, Header h2)
 {
-    // Load data from h1.
-    struct rpmtd_s td_bn, td_dn, td_di;
-    int rc = headerGet(h1, RPMTAG_BASENAMES, &td_bn, HEADERGET_MINMEM);
+    // Load Dirnames first.
+    struct rpmtd_s td_dn;
+    int rc = headerGet(h1, RPMTAG_DIRNAMES, &td_dn, HEADERGET_MINMEM);
     if (rc != 1)
 	return;
-    assert(td_bn.type == RPM_STRING_ARRAY_TYPE);
-    assert(td_bn.count > 0);
-    rc = headerGet(h1, RPMTAG_DIRNAMES, &td_dn, HEADERGET_MINMEM);
-    assert(rc == 1);
     assert(td_dn.type == RPM_STRING_ARRAY_TYPE);
     assert(td_dn.count > 0);
-    assert(td_dn.count <= td_bn.count);
+    // Load dirInfo and see if there are useful dirs.
+    struct dirInfoH *dinfo = makeDirInfoH(td_dn.data, td_dn.count);
+    if (!dinfo) {
+	rpmtdFreeData(&td_dn);
+	return;
+    }
+    // Load Basenames and Dirindexes.
+    struct rpmtd_s td_bn, td_di;
+    rc = headerGet(h1, RPMTAG_BASENAMES, &td_bn, HEADERGET_MINMEM);
+    assert(rc == 1);
+    assert(td_bn.type == RPM_STRING_ARRAY_TYPE);
+    assert(td_bn.count > 0);
+    assert(td_bn.count >= td_dn.count);
     rc = headerGet(h1, RPMTAG_DIRINDEXES, &td_di, HEADERGET_MINMEM);
     assert(rc == 1);
     assert(td_di.type == RPM_INT32_TYPE);
@@ -305,28 +422,21 @@ void copyStrippedFileList(Header h1, Header h2)
     unsigned *di1 = td_di.data, *di2 = NULL;
     size_t bnc1 = td_bn.count, bnc2 = 0;
     size_t dnc1 = td_di.count, dnc2 = 0;
-    // Current directory.
-    const char *d = NULL;
-    size_t dlen = 0;
-    // If the current file is under bindir.
-    bool bin = false;
-    // From the previous iteration.
-    size_t last_di1 = (size_t) -1;
-    const char *last_dn2 = NULL;
     // Run the copy loop.
     for (size_t i = 0; i < bnc1; i++) {
-	// Load dir.
-	if (di1[i] != last_di1) {
-	    size_t di = last_di1 = di1[i];
-	    assert(di < dnc1);
-	    d = dn1[di];
-	    dlen = strlen(d);
-	    bin = bindir(d, dlen);
-	}
-	// Not a useful file?
-	const char *b = bn1[i];
-	if (!bin && !depFile(d, dlen, b))
+	// Check the dir and the basename.
+	size_t di = di1[i];
+	assert(di < dnc1);
+	struct dirInfoH *d = &dinfo[di];
+	switch (d->need) {
+	case D_CHECK:
+	    if (depFile(d->fp, bn1[i]))
+		break;
+	case D_SKIP:
 	    continue;
+	default:
+	    assert(d->need == D_BIN);
+	}
 	// Allocate arrays for h2.
 	if (!bn2) {
 	    // Will need at most that many basenames and dirindexes.
@@ -340,36 +450,13 @@ void copyStrippedFileList(Header h1, Header h2)
 	    di2 = (unsigned *) (dn2 + dnc1);
 	}
 	// Put basename; bnc2 gets increased when dirindex is added.
-	bn2[bnc2] = b;
-	// Deal with dirname and dirindex.
-	if (d == last_dn2)
-	    // The same dirname, the same dirindex.
-	    di2[bnc2] = di2[bnc2-1], bnc2++;
-	else if (bnc2 <= 1) {
-	    // With bnc2 == 0, nothing has been added yet.
-	    // With bnc2 == 1, there's only one dirname that didn't match.
-	    dn2[dnc2] = d;
-	    di2[bnc2++] = dnc2++;
-	    last_dn2 = d;
-	}
+	bn2[bnc2] = bn1[i];
+	// See if the directory was already added.
+	if (d->dj != (unsigned) -1)
+	    di2[bnc2++] = d->dj;
 	else {
-	    // See if the directory was already added.  Since the last dirname
-	    // didn't match, with bnc2 == 2, only dn2[0] needs to be checked.
-	    size_t j = bnc2 - 2;
-	    while (1) {
-		if (dn2[j] == d) {
-		    di2[bnc2++] = j;
-		    last_dn2 = d;
-		    break;
-		}
-		if (j == 0) {
-		    dn2[dnc2] = d;
-		    di2[bnc2++] = dnc2++;
-		    last_dn2 = d;
-		    break;
-		}
-		j--;
-	    }
+	    dn2[dnc2] = dn1[di];
+	    di2[bnc2++] = d->dj = dnc2++;
 	}
     }
     // Put to h2.
@@ -380,6 +467,9 @@ void copyStrippedFileList(Header h1, Header h2)
 	// Arrays were allocated in a single chunk.
 	free(bn2);
     }
+    // See if dinfo was malloc'd.
+    if (dinfo != dirInfoBuf.H)
+	free(dinfo);
     // Dispose of h1 data.
     rpmtdFreeData(&td_bn);
     rpmtdFreeData(&td_dn);

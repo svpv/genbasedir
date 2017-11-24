@@ -306,9 +306,9 @@ static struct dirInfoB *makeDirInfoB(struct ent *e, size_t n, char *data, unsign
 
 // Check if a file from %{FILENAMES} is in the set of depFiles.
 // Assumes that the dir is D_CHECK and its hash is dirfp.
-static bool depFile(uint64_t dirfp, const char *b)
+static bool depFile(uint64_t dirfp, const char *b, size_t blen)
 {
-    uint64_t fp = hash64(b, strlen(b), dirfp);
+    uint64_t fp = hash64(b, blen, dirfp);
     return fpset_has(depFiles, fp);
 }
 
@@ -430,7 +430,7 @@ void copyStrippedFileList(Header h1, Header h2)
 	struct dirInfoH *d = &dinfo[di];
 	switch (d->need) {
 	case D_CHECK:
-	    if (depFile(d->fp, bn1[i]))
+	    if (depFile(d->fp, bn1[i], strlen(bn1[i])))
 		break;
 	case D_SKIP:
 	    continue;
@@ -474,6 +474,214 @@ void copyStrippedFileList(Header h1, Header h2)
     rpmtdFreeData(&td_bn);
     rpmtdFreeData(&td_dn);
     rpmtdFreeData(&td_di);
+}
+
+#include "crpmtag.h"
+
+// Strip file list inplace.  The results should be byte-for-byte identical
+// to the blobs created with librpm API.
+size_t stripFileList(void *blob, size_t blobSize)
+{
+    unsigned il = ntohl(*((unsigned *) blob + 0));
+    unsigned dl = ntohl(*((unsigned *) blob + 1));
+    assert(8 + 16 * il + dl == blobSize);
+    // Ensure that the blob memory is aligned at least to RPM_INT32_TYPE.
+    // Later we use this fact to align the write pointer.
+    assert(((uintptr_t) blob & 3) == 0);
+    // The blob starts with these "index entries", followed by data.
+    struct ent *ee = (void *) ((char *) blob + 8);
+    // This special "end of entries" pointer will be updated in case of
+    // (Basenames,Dirnames,Dirindexes) entries are excised.
+    struct ent *eend = ee + il;
+    // The data pointer, used as a source for copying, always stays the same.
+    char *data = (char *) eend;
+    // We expect 4 last entries to be APT tags (starting with CRPMTAG_FILENAME),
+    // preceded by (Basenames,Dirnames,Dirindexes), and we probe one more entry
+    // before Basenames.
+    assert(il > 7);
+    struct ent *e = eend - 4;
+    assert(e->tag == htonl(CRPMTAG_FILENAME));
+    // Position e[0] = Dirindexes, e[1] = Basenames, e[2] = Dirnames.
+    enum { E_DI, E_BN, E_DN };
+    e -= 3;
+    // Check Dirindexes.
+    if (e[E_DI].tag != htonl(RPMTAG_DIRINDEXES)) {
+	// No filenames => nothing to strip.
+	assert(ntohl(e[E_DI].tag) < RPMTAG_DIRINDEXES);
+	return blobSize;
+    }
+    assert(e[E_DI].type == htonl(RPM_INT32_TYPE));
+    // Check Dirnames.
+    assert(e[E_DN].tag == htonl(RPMTAG_DIRNAMES));
+    assert(e[E_DN].type == htonl(RPM_STRING_ARRAY_TYPE));
+    size_t dnc1 = ntohl(e[E_DN].cnt);
+    assert(dnc1 > 0);
+    // Load Dirnames.
+    struct dirInfoB *dinfo = makeDirInfoB(&e[E_DN], dnc1, data, dl);
+    // The write pointer to append the remaining tags.
+    char *p;
+    // The picture summarizes the memory layout of a blob.
+    // The write pointer operates somewhere around here: p
+    //                                                   v
+    // +---------+==========+----------*----------+==========+---------+
+    // | RPMTAG  | Di,Bn,Dn | CRPMTAG  *  RPMTAG  | Di,Bn,Dn | CRPMTAG |
+    // | entries | entries  | entries  *  data    | data     | data    |
+    // +---------+==========+----------*----------+==========+---------+
+    // This depicts the memmove call that excises the Di,Bn,Dn entries:
+    //                      [----------*----------]
+    //           [----------*----------]   <---'
+    if (dinfo) {
+	// Check Basenames.
+	assert(e[E_BN].tag == htonl(RPMTAG_BASENAMES));
+	assert(e[E_BN].type == htonl(RPM_STRING_ARRAY_TYPE));
+	assert(e[E_BN].cnt == e[E_DI].cnt);
+	size_t bnc1 = ntohl(e[E_BN].cnt);
+	assert(bnc1 >= dnc1);
+	// The output index/count.
+	size_t bnc2 = 0, dnc2 = 0;
+	// Dirindexes are indexed with i and bnc2.
+	unsigned off = ntohl(e[E_DI].off); assert(off < dl);
+	unsigned *di1 = (void *) (data + off), *di2 = di1;
+	// Basenames are advanced at each iteration.
+	off = ntohl(e[E_BN].off); assert(off < dl);
+	char *bn0 = data + off, *bn1 = bn0, *bn2 = bn1;
+	// Dirnames may need reordering, and rewriting them inplace is problematic.
+	size_t dn2bufsize = dinfo[dnc1-1].off + dinfo[dnc1-1].len + 1 - dinfo[0].off;
+	char *dn2buf = xmalloc(dn2bufsize), *dn2 = dn2buf;
+	// Run the copy loop.
+	for (size_t i = 0; i < bnc1; i++) {
+	    size_t di = ntohl(di1[i]);
+	    assert(di < dnc1);
+	    struct dirInfoB *d = &dinfo[di];
+	    assert(bn1 < data + dl);
+	    size_t blen = strlen(bn1);
+	    switch (d->need) {
+	    case D_CHECK:
+		if (depFile(d->fp, bn1, blen))
+		    break;
+	    case D_SKIP:
+		bn1 += blen + 1;
+		continue;
+	    default:
+		assert(d->need == D_BIN);
+	    }
+	    // Trying to take advantage of the fact that filenames under /bin/
+	    // and /usr/bin/ are often the very first filenames in a package.
+	    if (i == bnc2) {
+		// No need to copy basename.
+		bn1 += blen + 1, bn2 = bn1;
+		// Still need to mark directories in use.
+		if (d->dj == (unsigned) -1) {
+		    // We manage to use dirindexes in network byte order,
+		    // without conversion.  Note that htonl(-1) == -1.
+		    d->dj = di1[i], dnc2++;
+		    // Copy dirname.
+		    memcpy(dn2, data + d->off, d->len + 1);
+		    dn2 += d->len + 1;
+		}
+	    }
+	    else {
+		// Copy basename.
+		memmove(bn2, bn1, blen + 1);
+		bn1 += blen + 1, bn2 += blen + 1;
+		// Deal with dirindex and dirname.
+		if (d->dj != (unsigned) -1)
+		    di2[bnc2] = d->dj;
+		else {
+		    di2[bnc2] = d->dj = htonl(dnc2++);
+		    memcpy(dn2, data + d->off, d->len + 1);
+		    dn2 += d->len + 1;
+		}
+	    }
+	    bnc2++;
+	}
+	// No useful files found?
+	if (bnc2 == 0) {
+	    // Pretend as if makeDirInfoB returned NULL.
+	    if (dinfo != dirInfoBuf.B)
+		free(dinfo);
+	    dinfo = NULL;
+	}
+	else {
+	    // Dirindexes are already at the right position,
+	    // but Basenames need to be moved to adjoin Dirindexes.
+	    p = (void *) (di2 + bnc2);
+	    memmove(p, bn0, bn2 - bn0);
+	    e[E_BN].off = htonl(p - data);
+	    e[E_BN].cnt = e[E_DI].cnt = htonl(bnc2);
+	    p += bn2 - bn0;
+	    // Followed by Dirnames.
+	    e[E_DN].off = htonl(p - data);
+	    e[E_DN].cnt = htonl(dnc2);
+	    memcpy(p, dn2buf, dn2 - dn2buf);
+	    p += dn2 - dn2buf;
+	    // The entries are kept, advance to the remaining tags.
+	    e += 3;
+	}
+	free(dn2buf);
+    }
+    if (!dinfo) {
+	// Dirindexes are preceded by either ProvideVersion or ObsoleteVersion.
+	assert(e[-1].type == htonl(RPM_STRING_ARRAY_TYPE));
+	// Hence the previous entry should be null-terminated.
+	unsigned off = ntohl(e->off);
+	assert(off < dl);
+	assert(data[off-1] == '\0');
+	// So the problem is that Dirindexes are RPM_INT32_TYPE, and a few
+	// trailing null bytes were issued before Dirindexes for alignment.
+	// Those bytes we need to step back (before appending CRPMTAG_FILENAME
+	// which is RPM_STRING_TYPE), but don't know how many.  Going back to
+	// the rightmost non-null byte won't do, because ProvideVersion can
+	// be an empty string.  Therefore, we to rescan the preceding entry.
+	off = ntohl(e[-1].off);
+	assert(off < dl);
+	int cnt = htonl(e[-1].cnt);
+	assert(cnt > 0);
+	p = data + off;
+	for (int i = 0; i < cnt; i++) {
+	    assert(p < data + dl);
+	    p += strlen(p) + 1;
+	}
+	// Excise the entries!
+	memmove(e, e + 3, p - (char *) (e + 3));
+	eend -= 3, p -= 3 * sizeof *e;
+	// Update blob's il.
+	*((unsigned *) blob + 0) = htonl(eend - ee);
+    }
+    // Append the remaining tags.
+    for (; e < eend; e++) {
+	if (e->type == htonl(RPM_INT32_TYPE)) {
+	    // Align to a 4-byte boundary.
+	    switch ((uintptr_t) p & 3) {
+	    case 1: *p++ = '\0';
+	    case 2: *p++ = '\0';
+	    case 3: *p++ = '\0';
+	    }
+	    unsigned off = ntohl(e->off);
+	    assert(off < dl);
+	    unsigned cnt = ntohl(e->cnt);
+	    // TODO: check cnt.
+	    memmove(p, data + off, 4 * cnt);
+	    assert(((p - (char *) eend) & 3) == 0);
+	    e->off = htonl(p - (char *) eend);
+	    p += 4 * cnt;
+	}
+	else {
+	    assert(e->type == htonl(RPM_STRING_TYPE));
+	    unsigned off = ntohl(e->off);
+	    assert(off < dl);
+	    // XXX strlen is somewhat insecure here.
+	    size_t len = strlen(data + off);
+	    memmove(p, data + off, len + 1);
+	    e->off = htonl(p - (char *) eend);
+	    p += len + 1;
+	}
+    }
+    if (dinfo != dirInfoBuf.B)
+	free(dinfo);
+    // Update blob's dl.
+    *((unsigned *) blob + 1) = htonl(p - (char *) eend);
+    return p - (char *) blob;
 }
 
 #include <stdio.h>

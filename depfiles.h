@@ -29,3 +29,6 @@ void findDepFilesB(const void *blob, size_t blobSize);
 
 // Copy useful files from h1 to h2.
 void copyStrippedFileList(Header h1, Header h2);
+
+// Strip file list inplace, returns the new size.
+size_t stripFileList(void *blob, size_t blobSize);

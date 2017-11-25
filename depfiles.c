@@ -546,8 +546,10 @@ size_t stripFileList(void *blob, size_t blobSize)
 	off = ntohl(e[E_BN].off); assert(off < dl);
 	char *bn0 = data + off, *bn1 = bn0, *bn2 = bn1;
 	// Dirnames may need reordering, and rewriting them inplace is problematic.
-	size_t dn2bufsize = dinfo[dnc1-1].off + dinfo[dnc1-1].len + 1 - dinfo[0].off;
-	char *dn2buf = xmalloc(dn2bufsize), *dn2 = dn2buf;
+	static char dn0buf[256];
+	char *dn0 = NULL, *dn2 = NULL;
+	// The last matching dirindex between the input and the output.
+	ssize_t maxdi = -1;
 	// Run the copy loop.
 	for (size_t i = 0; i < bnc1; i++) {
 	    size_t di = ntohl(di1[i]);
@@ -575,9 +577,9 @@ size_t stripFileList(void *blob, size_t blobSize)
 		    // We manage to use dirindexes in network byte order,
 		    // without conversion.  Note that htonl(-1) == -1.
 		    d->dj = di1[i], dnc2++;
-		    // Copy dirname.
-		    memcpy(dn2, data + d->off, d->len + 1);
-		    dn2 += d->len + 1;
+		    // Directories match as well, only need to update maxdi.
+		    if (maxdi < (ssize_t) di)
+			maxdi = di;
 		}
 	    }
 	    else {
@@ -589,6 +591,14 @@ size_t stripFileList(void *blob, size_t blobSize)
 		    di2[bnc2] = d->dj;
 		else {
 		    di2[bnc2] = d->dj = htonl(dnc2++);
+		    if (dn2 == NULL) {
+			// Will only need to recombine dirnames past maxdi.
+			size_t n = dinfo[dnc1-1].off - dinfo[maxdi+1].off
+				 + dinfo[dnc1-1].len + 1;
+			dn0 = dn2 = dn0buf;
+			if (n > sizeof dn0buf)
+			    dn0 = dn2 = xmalloc(n);
+		    }
 		    memcpy(dn2, data + d->off, d->len + 1);
 		    dn2 += d->len + 1;
 		}
@@ -613,12 +623,24 @@ size_t stripFileList(void *blob, size_t blobSize)
 	    // Followed by Dirnames.
 	    e[E_DN].off = htonl(p - data);
 	    e[E_DN].cnt = htonl(dnc2);
-	    memcpy(p, dn2buf, dn2 - dn2buf);
-	    p += dn2 - dn2buf;
+	    // First part, original dirnames.
+	    if (maxdi != -1) {
+		size_t n = dinfo[maxdi].off - dinfo[0].off
+			 + dinfo[maxdi].len + 1;
+		memmove(p, data + dinfo[0].off, n);
+		p += n;
+	    }
+	    // Second part, recombined dirnames.
+	    if (dn2) {
+		memcpy(p, dn0, dn2 - dn0);
+		p += dn2 - dn0;
+	    }
 	    // The entries are kept, advance to the remaining tags.
 	    e += 3;
 	}
-	free(dn2buf);
+	// See if dn0 was malloc'd.
+	if (dn0 != dn0buf)
+	    free(dn0);
     }
     if (!dinfo) {
 	// Dirindexes are preceded by either ProvideVersion or ObsoleteVersion.

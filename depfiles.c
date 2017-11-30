@@ -670,34 +670,62 @@ size_t stripFileList(void *blob, size_t blobSize)
 	// Update blob's il.
 	*((unsigned *) blob + 0) = htonl(eend - ee);
     }
-    // Append the remaining tags.
-    for (; e < eend; e++) {
-	if (e->type == htonl(RPM_INT32_TYPE)) {
-	    // Align to a 4-byte boundary.
-	    switch ((uintptr_t) p & 3) {
-	    case 1: *p++ = '\0';
-	    case 2: *p++ = '\0';
-	    case 3: *p++ = '\0';
-	    }
-	    unsigned off = ntohl(e->off);
-	    assert(off < dl);
-	    unsigned cnt = ntohl(e->cnt);
-	    // TODO: check cnt.
-	    memmove(p, data + off, 4 * cnt);
-	    assert(((p - (char *) eend) & 3) == 0);
-	    e->off = htonl(p - (char *) eend);
-	    p += 4 * cnt;
+    // Going to append the remaining tags.
+    unsigned off = ntohl(e->off);
+    assert(off < dl);
+    // Check if the write pointer and the remaining data have the same
+    // alignment (mod 4).  In this case, the remaining data can be transferred
+    // with a single memmove call.  Otherwise, as it turns out, only the first
+    // entry needs to be processed specially, and the rest can still be handled
+    // with a single memmove call.
+    if ((off & 3) != ((uintptr_t) p & 3)) {
+	// This must be CRPMTAG_FILENAME.
+	assert(e->type == htonl(RPM_STRING_TYPE));
+	// The string cannot be empty.
+	char *s = data + off;
+	assert(*s);
+	// Update the offset.
+	e->off = htonl(p - (char *) eend);
+	// Move to the next entry, which must be CRPMTAG_FILESIZE.
+	e++;
+	off = ntohl(e->off);
+	assert(off < dl);
+	// The next entry's data must be aligned to a 4-byte boundary.
+	assert((off & 3) == 0);
+	// The null byte at the end of string.
+	char *z = &data[off-1];
+	assert(z > s);
+	assert(*z == '\0');
+	// Look back for the first null byte.
+	while (z[-1] == '\0')
+	    z--;
+	// Put the string.
+	size_t len = z - s;
+	memmove(p, s, len + 1);
+	p += len + 1;
+	// Align to a 4-byte boundary.
+	switch ((uintptr_t) p & 3) {
+	case 1: *p++ = '\0';
+	case 2: *p++ = '\0';
+	case 3: *p++ = '\0';
 	}
-	else {
-	    assert(e->type == htonl(RPM_STRING_TYPE));
-	    unsigned off = ntohl(e->off);
-	    assert(off < dl);
-	    // XXX strlen is somewhat insecure here.
-	    size_t len = strlen(data + off);
-	    memmove(p, data + off, len + 1);
-	    e->off = htonl(p - (char *) eend);
-	    p += len + 1;
-	}
+    }
+    // The offset of the first remaining entry, i.e. e->off.
+    unsigned newoff = p - (char *) eend;
+    assert(newoff <= off);
+    // Offsets of all the remaining entries will differ by the same delta.
+    unsigned delta = off - newoff;
+    // Move the data.
+    memmove(p, data + off, dl - off);
+    p += dl - off;
+    // Update the offsets.
+    while (1) {
+	e->off = htonl(off - delta);
+	if (++e == eend)
+	    break;
+	off = ntohl(e->off);
+	assert(off < dl);
+	assert(off > delta);
     }
     if (dinfo != dirInfoBuf.B)
 	free(dinfo);

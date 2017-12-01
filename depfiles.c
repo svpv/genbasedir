@@ -25,7 +25,7 @@
 // is a PATH directory.  Files under such a directory will not be
 // stripped from the header file list.  The function works even when
 // d is not null-terminated and/or when dlen == 0.
-static bool bindir(const char *d, size_t dlen)
+static inline bool bindir(const char *d, size_t dlen)
 {
     // Compare a string to a string literal.
 #define strLen(ss) (sizeof(ss "") - 1)
@@ -222,7 +222,7 @@ struct dirInfoB {
 };
 
 // Load single dir info, header version.  Returns true if the dir is useful.
-static bool makeDirInfoH1(struct dirInfoH *d, const char *dn, size_t dlen)
+static inline bool makeDirInfoH1(struct dirInfoH *d, const char *dn, size_t dlen)
 {
     d->dj = (unsigned) -1;
     if (bindir(dn, dlen))
@@ -238,7 +238,7 @@ static bool makeDirInfoH1(struct dirInfoH *d, const char *dn, size_t dlen)
 }
 
 // Load single dir info, header blob version.
-static bool makeDirInfoB1(struct dirInfoB *d, const char *dn, size_t dlen)
+static inline bool makeDirInfoB1(struct dirInfoB *d, const char *dn, size_t dlen)
 {
     // Sort of a polymorphic call.
     return makeDirInfoH1((struct dirInfoH *) d, dn, dlen);
@@ -306,7 +306,7 @@ static struct dirInfoB *makeDirInfoB(struct ent *e, size_t n, char *data, unsign
 
 // Check if a file from %{FILENAMES} is in the set of depFiles.
 // Assumes that the dir is D_CHECK and its hash is dirfp.
-static bool depFile(uint64_t dirfp, const char *b, size_t blen)
+static inline bool depFile(uint64_t dirfp, const char *b, size_t blen)
 {
     uint64_t fp = hash64(b, blen, dirfp);
     return fpset_has(depFiles, fp);

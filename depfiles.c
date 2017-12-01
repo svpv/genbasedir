@@ -669,15 +669,27 @@ size_t stripFileList(void *blob, size_t blobSize)
 	// Those bytes we need to step back (before appending CRPMTAG_FILENAME
 	// which is RPM_STRING_TYPE), but don't know how many.  Going back to
 	// the rightmost non-null byte won't do, because ProvideVersion can
-	// be an empty string.  Therefore, we to rescan the preceding entry.
-	off = ntohl(e[-1].off);
-	assert(off < dl);
-	int cnt = htonl(e[-1].cnt);
-	assert(cnt > 0);
-	p = data + off;
-	for (int i = 0; i < cnt; i++) {
-	    assert(p < data + dl);
-	    p += strlen(p) + 1;
+	// be an empty string.  In other words, unless there is only one
+	// trailing null byte, we don't know if the second null byte is due
+	// to an empty version or due to alignment.  Therefore, we may need
+	// to rescan the preceding entry.
+	// (Further note that ProvideVersion/ObsoleteVersion takes at least 4
+	// bytes, because it is sandwiched between ProvideFlags/ObsoleteFlags
+	// and Dirindexes.  This justifies the unbounded data[off-2] probe.)
+	if (data[off-2] != '\0')
+	    p = data + off;
+	else {
+	    unsigned prevoff = ntohl(e[-1].off);
+	    assert(prevoff < off);
+	    p = data + prevoff;
+	    int cnt = htonl(e[-1].cnt);
+	    assert(cnt > 0);
+	    for (int i = 0; i < cnt; i++) {
+		assert(p < data + dl);
+		// About 72% of Provides are versionless, so a lot of
+		// strlen calls can be spared.
+		p += *p ? strlen(p + 1) + 2 : 1;
+	    }
 	}
 	// Excise the entries!
 	memmove(e, e + 3, p - (char *) (e + 3));

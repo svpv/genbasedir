@@ -550,6 +550,21 @@ size_t stripFileList(void *blob, size_t blobSize)
 	char *dn0 = NULL, *dn2 = NULL;
 	// The last matching dirindex between the input and the output.
 	ssize_t maxdi = -1;
+	// Decrease bnc1 so that the last name's dir is not D_SKIP.
+	// This will spare unnecessary strlen(bn1) calls in the copy loop.
+	while (1) {
+	    size_t di = ntohl(di1[bnc1-1]);
+	    assert(di < dnc1);
+	    struct dirInfoB *d = &dinfo[di];
+	    if (d->need != D_SKIP)
+		break;
+	    // The search is unbounded, because we know that there must be
+	    // a dir that is not D_SKIP (otherwise, dinfo would be NULL).
+	    bnc1--;
+	    // There's a temptation to decrease bnc1 right here even further.
+	    // At least on Haswell, however, the nested loop would ruin the
+	    // performance of the outer loop.
+	}
 	// Run the copy loop.
 	for (size_t i = 0; i < bnc1; i++) {
 	    size_t di = ntohl(di1[i]);

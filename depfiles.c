@@ -75,27 +75,22 @@ static uint64_t hash64(const void *data, size_t size, uint64_t seed)
 static struct fpset *depFiles;
 
 // Add a filename dependency (which must start with a slash) to depFiles.
-// When the dependency comes from a header, its length is unknown; otherwise,
-// when it's been read from --useful-files=FILE, the length must be known.
-// Hence the routine should be instantiated with constant hasLen arg.
-static inline void addDepFile(const char *dep, size_t len, bool hasLen)
+static void addDepFile(const char *dep, size_t len)
 {
+    // Check if the name ends with a close paren.  Dependencies like
+    // "/etc/rc.d/init.d(status)" or "/usr/lib64/firefox/libxul.so()(64bit)"
+    // are not filenames.  Even though such filenames may well exist,
+    // dependencies on them are only permitted in between subpackages
+    // of the same source package (in which case the dependency gets
+    // optimized out by rpmbuild, so we'll never see it).
+    if (dep[len-1] == ')')
+	return;
     // Skip if it's under bindir; later the check for bindir will
     // pick it up anyway.  This fpset data structure works best when
     // it has the fewest elements.
     const char *rslash = strrchr(dep, '/');
     size_t dlen = rslash + 1 - dep; // including the slash
     if (bindir(dep, dlen))
-	return;
-    // Further check if it ends with a close paren.  Dependencies like
-    // "/etc/rc.d/init.d(status)" or "/usr/lib64/firefox/libxul.so()(64bit)"
-    // are not filenames.  Even though such filenames may well exist,
-    // dependencies on them are only permitted in between subpackages
-    // of the same source package (in which case the dependency gets
-    // optimized out by rpmbuild, so we'll never see it).
-    if (!hasLen)
-	len = dlen + strlen(rslash + 1);
-    if (dep[len-1] == ')')
 	return;
     // Add the fingerprint for the dir.  Later we check if the dir was added
     // and otherwise skip all the files under the dir.
@@ -120,11 +115,26 @@ static bool findDepFilesH1(Header h, int tag)
     if (rc != 1)
 	return false;
     assert(td.type == RPM_STRING_ARRAY_TYPE);
-    // Look for filename dependencies.
+    assert(td.count > 0);
     const char **deps = td.data;
-    for (unsigned i = 0; i < td.count; i++)
-	if (*deps[i] == '/')
-	    addDepFile(deps[i], 0, false);
+    // Check all names except for the last one.  Since deps[] pointers
+    // point into an argz vector, the length of each name can be deduced
+    // from the successive name.
+    size_t lasti = td.count - 1;
+    for (size_t i = 0; i < lasti; i++)
+	if (*deps[i] == '/') {
+	    assert(deps[i+1] > deps[i]);
+	    size_t len = deps[i+1] - deps[i] - 1;
+	    assert(deps[i][len] == '\0');
+	    addDepFile(deps[i], len);
+	}
+    // The length of the last name isn't known.  However, it is very unlikely
+    // that the last name starts with a slash.  Currently the last Provides
+    // entry is %name = %EVR, and the last Requires entry is rpmlib(PayloadIsLzma).
+    // File Conflicts are uncommon and forbidden in rpmbuild 4.0.  If names
+    // ever become sorted, filenames will collate before regular names.
+    if (*deps[lasti] == '/')
+	addDepFile(deps[lasti], strlen(deps[lasti]));
     rpmtdFreeData(&td);
     return true;
 }
@@ -162,7 +172,7 @@ static void findDepFilesB1(struct ent *e, char *data, unsigned dl)
 	// Iterations start at the beginning of a name.
 	if (*argz == '/') {
 	    size_t len = 1 + strlen(argz + 1);
-	    addDepFile(argz, len, true);
+	    addDepFile(argz, len);
 	    argz += len + 1;
 	}
 	else {
@@ -175,7 +185,7 @@ static void findDepFilesB1(struct ent *e, char *data, unsigned dl)
 	    size_t len = 1 + strlen(argz + 1);
 	    // Check if the slash is at the beginning of a name.
 	    if (argz[-1] == '\0')
-		addDepFile(argz, len, true);
+		addDepFile(argz, len);
 	    argz += len + 1;
 	    // When the length isn't needed for addDepFile, it might be
 	    // tempting to try and jump right to the next slash.  However,
@@ -787,7 +797,7 @@ void readDepFiles(const char *fname, unsigned char delim)
 	    continue;
 	if (*line != '/')
 	    die("%s: bad input", fname);
-	addDepFile(line, len, true);
+	addDepFile(line, len);
     }
     // Distinguish between EOF and error.
     assert(errno == 0);

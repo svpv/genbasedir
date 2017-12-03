@@ -67,6 +67,12 @@ static uint64_t hash64(const void *data, size_t size, uint64_t seed)
 #endif
 }
 
+// The seed used for fingerprinting, initialized later with a random
+// value from auxv.  This ensures that 1) crafting the data to elicit
+// the worst-case behaviour is pointless; 2) if it fails just by chance,
+// at least this can be fixed by running the program again.
+static uint64_t fpseed;
+
 // The set of 64-bit fingerprints of filename dependencies.  Works as
 // a probabilistic data structure for approximate membership queries.
 // In the worst case (which in a typical setting is highly unlikely)
@@ -94,7 +100,7 @@ static void addDepFile(const char *dep, size_t len)
 	return;
     // Add the fingerprint for the dir.  Later we check if the dir was added
     // and otherwise skip all the files under the dir.
-    uint64_t fp = hash64(dep, dlen, 0);
+    uint64_t fp = hash64(dep, dlen, fpseed);
     int rc = fpset_add(depFiles, fp);
     assert(rc >= 0);
     // Add the fingerprint for the dir+name.  Only the filename is actually
@@ -240,7 +246,7 @@ static inline bool makeDirInfoH1(struct dirInfoH *d, const char *dn, size_t dlen
     // Note that depFiles is checked here, so there's no need to check
     // depFiles later when iterating filenames.
     if (depFiles) {
-	uint64_t fp = hash64(dn, dlen, 0);
+	uint64_t fp = hash64(dn, dlen, fpseed);
 	if (fpset_has(depFiles, fp))
 	    return d->fp = fp, d->need = D_CHECK, true;
     }
@@ -322,13 +328,18 @@ static inline bool depFile(uint64_t dirfp, const char *b, size_t blen)
     return fpset_has(depFiles, fp);
 }
 
-// Called by the routines that add depFiles.
-static void initDepFiles(void)
+#include <sys/auxv.h>
+#include <unistd.h>
+
+// Called only once by one of the routines that add depFiles.
+static __attribute__((noinline)) void initDepFiles(void)
 {
-    if (!depFiles) {
-	depFiles = fpset_new(10);
-	assert(depFiles);
-    }
+    depFiles = fpset_new(10);
+    assert(depFiles);
+    // Since Linux 2.6.29, glibc 2.16.
+    void *auxrnd = (void *) getauxval(AT_RANDOM);
+    assert(auxrnd);
+    memcpy(&fpseed, auxrnd, sizeof fpseed);
 }
 
 // Called upon exit.
@@ -345,7 +356,8 @@ static __attribute__((destructor)) void freeDepFiles(void)
 // be tested against the set of depFiles and possibly preserved in the output.
 void findDepFilesH(Header h)
 {
-    initDepFiles();
+    if (!depFiles)
+	initDepFiles();
     // Empty Requires are not permitted - someplace, they check
     // for the "rpmlib(PayloadIsLzma)" dependency as mandatory.
     bool hasReq = findDepFilesH1(h, RPMTAG_REQUIRENAME);
@@ -370,7 +382,8 @@ void findDepFilesH(Header h)
 // A findDepFilesH counterpart which can process raw header blobs.
 void findDepFilesB(const void *blob, size_t blobSize)
 {
-    initDepFiles();
+    if (!depFiles)
+	initDepFiles();
     unsigned il = ntohl(*((unsigned *) blob + 0));
     unsigned dl = ntohl(*((unsigned *) blob + 1));
     assert(8 + 16 * il + dl == blobSize);
@@ -777,7 +790,8 @@ size_t stripFileList(void *blob, size_t blobSize)
 // Read filenames from --useful-files=FILE.
 void readDepFiles(const char *fname, unsigned char delim)
 {
-    initDepFiles();
+    if (!depFiles)
+	initDepFiles();
     FILE *fp = fopen(fname, "r");
     if (!fp)
 	die("%s: %m", fname);

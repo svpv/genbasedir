@@ -63,6 +63,7 @@ static void loadDir(int dirfd)
 #include "genutil.h"
 #include "crpmtag.h"
 #include "errexit.h"
+#include "md5cache.h"
 
 static const int tags[] = {
     RPMTAG_NAME,
@@ -106,7 +107,10 @@ static void *makeBlob(const char *srpmdir, const char *srpm, size_t *sizep)
     int rc = fstat(fd, &st);
     assert(rc == 0);
     addUint32Tag(h2, CRPMTAG_FILESIZE, st.st_size);
-    // TODO: add CRPMTAG_MD5SUM.
+    // Add CRPMTAG_MD5.
+    char md5[33];
+    md5cache(srpm, &st, fd, md5);
+    addStringTag(h2, CRPMTAG_MD5, md5);
     Fclose(FD);
     // Unload h2.
     unsigned blobSize;

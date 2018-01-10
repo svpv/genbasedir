@@ -60,13 +60,69 @@ static void loadDir(int dirfd)
     QSORT(nsrpm, srpms_less, srpms_swap);
 }
 
+#include "genutil.h"
+#include "crpmtag.h"
+#include "errexit.h"
+
+static const int tags[] = {
+    RPMTAG_NAME,
+    RPMTAG_EPOCH,
+    RPMTAG_VERSION,
+    RPMTAG_RELEASE,
+    RPMTAG_GROUP,
+    RPMTAG_ARCH,
+    RPMTAG_PACKAGER,
+    RPMTAG_SIZE,
+    RPMTAG_VENDOR,
+
+    RPMTAG_DESCRIPTION,
+    RPMTAG_SUMMARY,
+    /*RPMTAG_HEADERI18NTABLE*/ HEADER_I18NTABLE,
+
+    RPMTAG_REQUIREFLAGS,
+    RPMTAG_REQUIRENAME,
+    RPMTAG_REQUIREVERSION,
+};
+
+static void *makeBlob(const char *srpmdir, const char *srpm, size_t *sizep)
+{
+    // Load h1.
+    FD_t FD = Fopen(srpm, "r");
+    if (!FD)
+	die("%s: %m", srpm);
+    Header h1 = readHeader(srpm, FD);
+    if (!h1)
+	die("%s: cannot read package header", srpm);
+    // Copy to h2.
+    Header h2 = headerNew();
+    assert(h2);
+    copyTags(h1, h2, tags, sizeof tags / sizeof *tags);
+    headerFree(h1);
+    // Add credentials.
+    addStringTag(h2, CRPMTAG_DIRECTORY, srpmdir);
+    addStringTag(h2, CRPMTAG_FILENAME, srpm);
+    struct stat st;
+    int fd = Fileno(FD);
+    int rc = fstat(fd, &st);
+    assert(rc == 0);
+    addUint32Tag(h2, CRPMTAG_FILESIZE, st.st_size);
+    // TODO: add CRPMTAG_MD5SUM.
+    Fclose(FD);
+    // Unload h2.
+    unsigned blobSize;
+    void *blob = headerExport(h2, &blobSize);
+    assert(blob);
+    headerFree(h2);
+    *sizep = blobSize;
+    return blob;
+}
+
 #include <getopt.h>
 #include <limits.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include "prevout.h"
-#include "errexit.h"
 
 enum {
     OPT_FLAT = 256,
@@ -168,9 +224,8 @@ usage:	    fprintf(stderr, "Usage: %s [OPTIONS...] [ARGS...]\n", PROG);
 		blobSize = h->blobSize;
 	    }
 	}
-	if (!blob) {
-	    // TODO: load the blob.
-	}
+	if (!blob)
+	    blob = makeBlob(srpmdir, srpm, &blobSize);
 	// TODO: wirte the blob.
 	free(blob);
     }

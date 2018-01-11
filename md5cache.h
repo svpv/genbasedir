@@ -22,3 +22,4 @@
 
 // Provides MD5 sums for *.rpm files.
 void md5cache(const char *rpm, struct stat *st, int fd, char md5[33]);
+void md5nocache(const char *rpm, int fd, char md5[33]);

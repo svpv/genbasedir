@@ -98,6 +98,28 @@ static inline void md5hex(unsigned char bin[16], char str[33])
 
 #include <unistd.h>
 #include <openssl/md5.h>
+
+static inline void md5fd(const char *rpm, int fd, unsigned char bin[16])
+{
+    MD5_CTX c;
+    MD5_Init(&c);
+    if (lseek(fd, 0, 0) < 0)
+	die("%s: %m", "lseek");
+    while (1) {
+	char buf[BUFSIZ];
+	ssize_t ret = read(fd, buf, sizeof buf);
+	if (ret < 0) {
+	    if (errno == EINTR)
+		continue;
+	    die("%s: %m", rpm);
+	}
+	if (ret == 0)
+	    break;
+	MD5_Update(&c, buf, ret);
+    }
+    MD5_Final(bin, &c);
+}
+
 #include <endian.h>
 #include "md5cache.h"
 
@@ -151,27 +173,11 @@ void md5cache(const char *rpm, struct stat *st, int fd, char md5[33])
     }
     else if (rc != MDBX_NOTFOUND)
 	die("%s: %s", "mdbx_get", mdbx_strerror(rc));
-    // Calculate md5 the hard way.
-    MD5_CTX c;
-    MD5_Init(&c);
-    if (lseek(fd, 0, 0) < 0)
-	die("%s: %m", "lseek");
-    while (1) {
-	char buf[BUFSIZ];
-	ssize_t ret = read(fd, buf, sizeof buf);
-	if (ret < 0) {
-	    if (errno == EINTR)
-		continue;
-	    die("%s: %m", rpm);
-	}
-	if (ret == 0)
-	    break;
-	MD5_Update(&c, buf, ret);
-    }
     // Combine the "v" record.
     struct { unsigned sm[2]; unsigned char bin[16]; } smb;
     memcpy(smb.sm, sm, sizeof sm);
-    MD5_Final(smb.bin, &c);
+    // Calculate md5 the hard way.
+    md5fd(rpm, fd, smb.bin);
     v.iov_base = &smb, v.iov_len = sizeof smb;
     // Need to run the write transaction.  It is not entirely clear
     // whether dbi can be reused this way, but it seems to work.
@@ -180,6 +186,13 @@ void md5cache(const char *rpm, struct stat *st, int fd, char md5[33])
     rc = mdbx_put(wtxn, dbi, &k, &v, 0), assert(rc == 0);
     rc = mdbx_txn_commit(wtxn), assert(rc == 0);
     md5hex(smb.bin, md5);
+}
+
+void md5nocache(const char *rpm, int fd, char md5[33])
+{
+    unsigned char bin[16];
+    md5fd(rpm, fd, bin);
+    md5hex(bin, md5);
 }
 
 // ex:set ts=8 sts=4 sw=4 noet:

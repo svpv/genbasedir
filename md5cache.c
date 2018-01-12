@@ -18,8 +18,67 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+#include <stdbool.h>
 #include <string.h>
 #include <assert.h>
+
+// Compare a string to a string literal.
+#define strLen(s) (sizeof("" s) - 1)
+#define startsWith(s, len, ss) \
+    memcmp(s, ss, strLen(ss)) == 0
+#define endsWith(s, len, ss) \
+    memcmp(s + len - strLen(ss), ss, strLen(ss)) == 0
+
+// Somewhat sloppy comparison is justified by the following property.
+#define minRpmLen strLen("a-1-1.src.rpm")
+#define longestSuffix strLen(".noarch.rpm")
+static_assert(minRpmLen >= longestSuffix, "string literals compared safely");
+
+#ifdef MD5CACHE_SRC
+// Source rpms undergo a much simpler .src.rpm suffix removal.
+#else
+// Split rpm basename, already without .rpm suffix, into even shorter key
+// (without .arch suffix, ending with "-V-R") and arch.
+static bool split_ka(char *rpm, size_t len, char **k, size_t *klen, const char **a)
+{
+    if (endsWith(rpm, len, ".noarch")) {
+	*k = rpm, *a = "noarch";
+	rpm[len-strLen(".noarch")] = '\0';
+	*klen = len - strLen(".noarch");
+	return true;
+    }
+    if (startsWith(rpm, len, "i586-") && endsWith(rpm, len, ".i586")) {
+	*k = rpm + strLen("i586-"), *a = "i586-arepo";
+	rpm[len-strLen(".i586")] = '\0';
+	*klen = len - strLen(".i586") - strLen("i586-");
+	return true;
+    }
+    // Parse N[-debuginfo]-V-R.A.rpm.
+    char *endA = rpm + len;
+#define falseIfNull(x) if (__builtin_expect(x == NULL, 0)) return false
+    char *dotA = strrchr(rpm, '.'); falseIfNull(dotA); *dotA = '\0';
+    char *dashR = strrchr(rpm, '-'); falseIfNull(dashR); *dashR = '\0';
+    char *dashV = strrchr(rpm, '-'); falseIfNull(dashV); *dashV = '\0';
+    char *dashD = strrchr(rpm, '-'); *dashV = *dashR = '-';
+#define DSTR "-debuginfo"
+#define DLEN strLen(DSTR)
+    if (dashD == NULL || dashV - dashD != DLEN || memcmp(dashD, DSTR, DLEN)) {
+	*k = rpm, *a = dotA + 1;
+	*klen = dotA - rpm;
+	return true;
+    }
+    // Transform N-D V-R A => N-V-R A-D, e.g.
+    // foo-debuginfo-1.0-alt1.i586 => foo-1.0-alt1 i586-debuginfo
+    memmove(dashD, dashV, dotA - dashV + 1);
+    char *A = dashD + (dotA - dashV + 1);
+    memmove(A, dotA + 1, endA - dotA - 1);
+    memcpy(A + (endA - dotA - 1), DSTR, DLEN + 1);
+    *k = rpm, *a = A;
+    *klen = A - rpm - 1;
+    return true;
+}
+#endif
+
 #include <stdlib.h>
 #include <limits.h>
 #include <sys/stat.h>
@@ -48,17 +107,16 @@ static void md5cache_init(void)
     assert(home && *home == '/');
     size_t hlen = strlen(home);
 #define SUBDIR "/.cache/genbasedir/"
-#define STRLEN(s) (sizeof("" s) - 1)
-    assert(hlen + STRLEN(SUBDIR) + STRLEN(ENV) < PATH_MAX);
-    char path[hlen + STRLEN(SUBDIR) + STRLEN(ENV) + 1];
+    assert(hlen + strLen(SUBDIR) + strLen(ENV) < PATH_MAX);
+    char path[hlen + strLen(SUBDIR) + strLen(ENV) + 1];
     memcpy(path, home, hlen);
-    memcpy(path + hlen, SUBDIR, STRLEN(SUBDIR));
-    memcpy(path + hlen + STRLEN(SUBDIR), ENV, STRLEN(ENV) + 1);
+    memcpy(path + hlen, SUBDIR, strLen(SUBDIR));
+    memcpy(path + hlen + strLen(SUBDIR), ENV, strLen(ENV) + 1);
     // mkdir -p ~/.cache/genbasedir
-    char *slash1 = path + hlen + STRLEN(SUBDIR) - 1;
+    char *slash1 = path + hlen + strLen(SUBDIR) - 1;
     assert(*slash1 == '/'), *slash1 = '\0';
     if (mkdir(path, 0777) < 0 && errno != EEXIST) {
-	char *slash2 = path + hlen + STRLEN("/.cache/") - 1;
+	char *slash2 = path + hlen + strLen("/.cache/") - 1;
 	assert(*slash2 == '/'), *slash2 = '\0';
 	if (mkdir(path, 0777) < 0 && errno != EEXIST)
 	    die("%s: %m", path);
@@ -125,13 +183,29 @@ static inline void md5fd(const char *rpm, int fd, unsigned char bin[16])
 
 void md5cache(const char *rpm, struct stat *st, int fd, char md5[33])
 {
-    // Prepare the key without the .xxx.rpm suffix.
+    // Going to prepare the key without the .xxx.rpm suffix.
     size_t len = strlen(rpm);
-    assert(len > 8);
-    assert(memcmp(rpm + len - 4, ".rpm", 4) == 0);
-    assert(len <= NAME_MAX);
-    char key[len+1];
-    memcpy(key, rpm, len + 1);
+    if (len < minRpmLen)
+	die("%s: bad rpm name", rpm);
+#ifdef MD5CACHE_SRC
+    // Assume it ends with .src.rpm, that's what readdir should check.
+    len -= 8;
+#else
+    // Assume it ends with .rpm but not with .src.rpm.
+    len -= 4;
+#endif
+    char copy[len+1];
+    memcpy(copy, rpm, len);
+    copy[len] = '\0';
+#ifdef MD5CACHE_SRC
+    MDBX_val k = { copy, len };
+#else
+    // Deduce the arch and use it as the database name.
+    char *kk; size_t klen; const char *arch;
+    if (!split_ka(copy, len, &kk, &klen, &arch))
+	die("%s: bad rpm name", rpm);
+    MDBX_val k = { kk, klen };
+#endif
     // Initialize or renew the read transaction.
     int rc;
     if (!env)
@@ -139,18 +213,8 @@ void md5cache(const char *rpm, struct stat *st, int fd, char md5[33])
     else
 	rc = mdbx_txn_renew(rtxn), assert(rc == 0);
 #ifdef MD5CACHE_SRC
-    assert(memcmp(rpm + len - 8, ".src.rpm", 8) == 0);
-    key[len-8] = '\0';
     MDBX_dbi dbi = src_dbi;
-    MDBX_val k = { key, len - 8 };
 #else
-    // Deduce the arch and use it as the database name.
-    assert(memcmp(rpm + len - 8, ".src.rpm", 8) != 0);
-    key[len-4] = '\0';
-    char *arch = strrchr(key, '.');
-    assert(arch);
-    MDBX_val k = { key, arch - key };
-    *arch++ = '\0', assert(*arch);
     MDBX_dbi dbi;
     rc = mdbx_dbi_open(rtxn, arch, 0, &dbi), assert(rc == 0);
 #endif

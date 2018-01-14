@@ -79,6 +79,74 @@ static bool split_ka(char *rpm, size_t len, char **k, size_t *klen, const char *
 }
 #endif
 
+// The cache database is a stream of cache entries preceded by the header.
+// The cache database is further compressed with Zstd, to whom I entrust
+// basic integrity checking such as file magic and checksumming (which is
+// no small matter if you think what happens after we discharge bad md5).
+//
+// The header is:
+// atime0: 2 bytes, atime1: 2 bytes.
+//
+// Each cache entry has the atime field, calculated as (time >> 16),
+// and approximately representing days since the epoch.  Entries are
+// cleaned automatically after being unused for N days.  However,
+// entries must not be cleared immediately after a long absence (such
+// as when building distro releases every once in a while).  The scheme
+// with atime0 and atime1 in the header tries to address exactly this
+// problem.  atime1 represents "a recent" access to the cache, while
+// atime0 records "the previous" time.  To make this work, the following
+// rules apply.
+//
+// 1) atime is updated by the caller (that is, the caller sets atime0=atime1
+// and atime1=now) if and only if now - atime1 > 1 (or possibly > 2 or > 3).
+// In other words, last access time to the cache should not be updated simply
+// on the basis of yesterday+1=today, which can be just an "unlucky moment";
+// instead, there must be a "grace period" of at least about a working day
+// before we can decide which entries have been used again.
+// 2) Entries are cleaned as if their age is relative to atime0, rather than
+// relative to now.  In other words, some entries cannot be massively cleared
+// before the record of the long absence goes away.
+//
+// (The scheme is of my own very recent invention, as of January 2018;
+// I'm still pondering if it can be simplified or improved.)
+//
+// Each entry is:
+// keylen: 1 byte, key: not null-terminated,
+// file size+mtime: packed into 6 bytes,
+// cache entry atime: 2 bytes,
+// md5: 16 bytes, sha256: 32 bytes.
+
+struct ent {
+    unsigned key; // index into strtab
+    unsigned short sm[3];
+    unsigned short atime;
+    unsigned char md5[16];
+    unsigned char sha256[32];
+};
+
+#ifdef MD5CACHE_SRC
+// Assume no more than 256K srpms will ever be processed at once.
+#define NENT (2<<17)
+#else
+// Binary repos enjoy moderately larger counts (due to subpackages).
+#define NENT (3<<17)
+// There can also be special binary repos, such as distro's RPMS.main,
+// which are combined of a few repo components (e.g. x86_64, noarch,
+// and i586-arepo).  In other words, we may need to open a few per-arch
+// sub-databases within a single run.
+#define MAXSUBDB 4
+#endif
+
+// The average length of srpm keys is 29, the average length of x86_64 keys
+// is about 30, while the average length of noarch keys is 35, but the latter
+// are fewer in number.
+static char strtab[32*NENT];
+// This strtab is peculiar in that it stores only short strings (this follows
+// from the fact than keys cannot be longer than NAME_MAX, which is 255).
+// This makes it possible for the preceding byte to store the string's length,
+// saving many a strlen call.  The strings are null-terminated nonetheless.
+static unsigned strtabPos = 1;
+
 #include <stdlib.h>
 #include <limits.h>
 #include <sys/stat.h>

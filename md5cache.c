@@ -79,41 +79,15 @@ static bool split_ka(char *rpm, size_t len, char **k, size_t *klen, const char *
 }
 #endif
 
-// The cache database is a stream of cache entries preceded by the header.
-// The cache database is further compressed with Zstd, to whom I entrust
-// basic integrity checking such as file magic and checksumming (which is
-// no small matter if you think what happens after we discharge bad md5).
-//
-// The header is:
-// atime0: 2 bytes, atime1: 2 bytes.
-//
-// Each cache entry has the atime field, calculated as (time >> 16),
-// and approximately representing days since the epoch.  Entries are
-// cleaned automatically after being unused for N days.  However,
-// entries must not be cleared immediately after a long absence (such
-// as when building distro releases every once in a while).  The scheme
-// with atime0 and atime1 in the header tries to address exactly this
-// problem.  atime1 represents "a recent" access to the cache, while
-// atime0 records "the previous" time.  To make this work, the following
-// rules apply.
-//
-// 1) atime is updated by the caller (that is, the caller sets atime0=atime1
-// and atime1=now) if and only if now - atime1 > 1 (or possibly > 2 or > 3).
-// In other words, last access time to the cache should not be updated simply
-// on the basis of yesterday+1=today, which can be just an "unlucky moment";
-// instead, there must be a "grace period" of at least about a working day
-// before we can decide which entries have been used again.
-// 2) Entries are cleaned as if their age is relative to atime0, rather than
-// relative to now.  In other words, some entries cannot be massively cleared
-// before the record of the long absence goes away.
-//
-// (The scheme is of my own very recent invention, as of January 2018;
-// I'm still pondering if it can be simplified or improved.)
+// The cache database is a stream of cache entries; the stream is further
+// compressed with Zstd, to whom I entrust basic integrity checking such as
+// file magic and checksumming (which is no small matter if you think what
+// happens after we discharge bad md5).
 //
 // Each entry is:
 // keylen: 1 byte, key: not null-terminated,
 // file size+mtime: packed into 6 bytes,
-// cache entry atime: 2 bytes,
+// cache entry atime: 2 bytes (unix time >> 16),
 // md5: 16 bytes, sha256: 32 bytes.
 
 struct ent {

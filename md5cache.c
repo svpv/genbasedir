@@ -34,6 +34,9 @@
 #define longestSuffix strLen(".noarch.rpm")
 static_assert(minRpmLen >= longestSuffix, "string literals compared safely");
 
+// Additionally a key (typically "N-V-R") should be at least this long.
+#define minKeyLen strLen("a-1-1")
+
 #ifdef MD5CACHE_SRC
 // Source rpms undergo a much simpler .src.rpm suffix removal.
 #else
@@ -90,8 +93,8 @@ static bool split_ka(char *rpm, size_t len, char **k, size_t *klen, const char *
 // cache entry atime: 2 bytes (unix time >> 16),
 // md5: 16 bytes, sha256: 32 bytes.
 
-struct ent {
-    unsigned key; // index into strtab
+// The "entry value", i.e. the entry save the key.
+struct entv {
     unsigned short sm[3];
     unsigned short atime;
     unsigned char md5[16];
@@ -120,6 +123,88 @@ static char strtab[32*NENT];
 // This makes it possible for the preceding byte to store the string's length,
 // saving many a strlen call.  The strings are null-terminated nonetheless.
 static unsigned strtabPos = 1;
+
+static inline unsigned addStr(const char *str, size_t len)
+{
+    assert(len <= 255);
+    if (strtabPos + len >= sizeof strtab)
+	return -1;
+    *(unsigned char *) (strtab + strtabPos - 1) = len;
+    memcpy(strtab + strtabPos, str, len);
+    unsigned pos = strtabPos;
+    strtabPos += len + 2;
+    return pos;
+}
+
+struct md5db {
+    size_t lend; // loaded from disk
+    size_t aend; // added during runtime
+    unsigned kk[NENT]; // key indexes into strtab
+    struct entv ee[NENT];
+};
+
+#include "reada.h"
+#include "zstdreader.h"
+#if NREADA != 4096
+#warning "suboptimal NREADA"
+#endif
+
+#define ERRSTR(str) err[0] = __func__, err[1] = str
+
+static bool md5db_readloop(struct md5db *db, struct zstdreader *z, const char *err[2])
+{
+    // Read the first byte, which is the length of a key.
+    unsigned char klen;
+    ssize_t zret = zstdreader_read(z, &klen, 1, err);
+    if (zret <= 0) // Caveat emptor - let the caller beware if it's EOF.
+	return zret == 0;
+    // The length is known, read the record.
+    char buf[256+64];
+    while (1) {
+	if (klen < minKeyLen)
+	    return ERRSTR("bad keylen"), false;
+	// Read the rest of the record + 1 more byte.
+	size_t nread = klen + sizeof(struct entv) + 1;
+	zret = zstdreader_read(z, buf, nread, err);
+	if (zret < 0)
+	    return false;
+	if (zret < nread - 1)
+	    return ERRSTR("unexpected EOF"), false;
+	if (db->lend == NENT)
+	    return ERRSTR("too many entries"), false;
+	unsigned six = addStr(buf, klen);
+	if (six == -1)
+	    return ERRSTR("too many keys"), false;
+	db->kk[db->lend] = six;
+	memcpy(db->ee + db->lend, buf + klen, sizeof(struct entv));
+	db->lend++;
+	// EOF?
+	if (zret == nread - 1)
+	    return true;
+	// Next klen.
+	klen = *(unsigned char *) &buf[nread-1];
+    }
+}
+
+static bool md5db_readall(struct md5db *db, int fd, const char *err[2])
+{
+    char fdabuf[NREADA];
+    struct fda fda = { fd, fdabuf };
+    struct zstdreader *z;
+    int rc = zstdreader_open(&z, &fda, err);
+    if (rc <= 0)
+	return rc == 0;
+    bool ok = md5db_readloop(db, z, err);
+    if (ok) {
+	// Sloppy test for EOF, saves a system call.
+	ok = fda.cur == fda.end;
+	if (!ok)
+	    ERRSTR("trailing garbage");
+    }
+    zstdreader_free(z);
+    db->aend = db->lend;
+    return ok;
+}
 
 #include <stdlib.h>
 #include <limits.h>
@@ -244,7 +329,7 @@ void md5cache(const char *rpm, struct stat *st, int fd, char md5[33])
 #else
     // Deduce the arch and use it as the database name.
     char *kk; size_t klen; const char *arch;
-    if (!split_ka(copy, len, &kk, &klen, &arch))
+    if (!split_ka(copy, len, &kk, &klen, &arch) || klen < minKeyLen)
 	die("%s: bad rpm name", rpm);
     MDBX_val k = { kk, klen };
 #endif

@@ -223,6 +223,21 @@ static struct entv *md5db_find(struct md5db *db, const char *key)
     return NULL;
 }
 
+#include "qsort.h"
+
+// Sort added entries.
+static void md5db_asort(struct md5db *db)
+{
+    unsigned *kk = db->kk + db->lend;
+    struct entv *ee = db->ee + db->lend;
+#define LESS(i, j) strcmp(strtab + kk[i], strtab + kk[j]) < 0
+    unsigned k; struct entv e;
+#define SWAP(i, j) k = kk[i], kk[i] = kk[j], kk[j] = k, \
+		   e = ee[i], ee[i] = ee[j], ee[j] = e
+    size_t n = db->aend - db->lend;
+    QSORT(n, LESS, SWAP);
+}
+
 #include <stdlib.h>
 #include <limits.h>
 #include <sys/stat.h>

@@ -101,6 +101,8 @@ struct entv {
     unsigned char sha256[32];
 };
 
+unsigned short now;
+
 #ifdef MD5CACHE_SRC
 // Assume no more than 256K srpms will ever be processed at once.
 #define NENT (2<<17)
@@ -236,6 +238,66 @@ static void md5db_asort(struct md5db *db)
 		   e = ee[i], ee[i] = ee[j], ee[j] = e
     size_t n = db->aend - db->lend;
     QSORT(n, LESS, SWAP);
+}
+
+#include "zstdwriter.h"
+
+// Entries older than about 15 days are purged automatically.
+#define OLD(atime) (atime + 20 < now)
+
+// Process a single key, write a record from the table, unless it's too old.
+// Further merge with the other state, if there is one.  Unless the record
+// is fresh (or has been refreshed via cache hit), prefer to pass through
+// the record from the other state (in case it was refreshed there).
+static inline bool md5db_write1(struct md5db *db, struct zstdwriter *z,
+				struct zstdreader *z0, struct state0 *st0,
+				const char *k, struct entv *e, const char *err[2])
+{
+    bool fresh = e->atime == now + 1;
+    if (z0) {
+	int rc = md5db_catchup(z, z0, st0, k, fresh, err);
+	if (rc) // Either error or wrote k.
+	    return rc > 0;
+    }
+    if (fresh)
+	e->atime = now;
+    else if (OLD(e->atime))
+	return true;
+    unsigned char klen = *(unsigned char *) &k[-1];
+    if (!zstdwriter_write(z, k - 1, klen + 1, err))
+	return false;
+    if (!zstdwriter_write(z, e, sizeof *e, err))
+	return false;
+    return true;
+}
+
+// Generic 3-way merge, loaded + added + z0 changed in the meantime.
+static bool md5db_writeloop(struct md5db *db, struct zstdreader *z0,
+			    struct zstdwriter *z, const char *err[2])
+{
+    struct state0 st0 = {};
+    size_t i = 0, j = db->lend;
+    unsigned *kk = db->kk;
+    // Merge loaded + added entries.
+    while (i < db->lend && j < db->aend) {
+	const char *k; struct entv *e;
+	int cmp = strcmp(strtab + kk[i], strtab + kk[j]);
+	if (cmp < 0)
+	    k = strtab + kk[i], e = &db->ee[i], i++;
+	else
+	    k = strtab + kk[j], e = &db->ee[j], j++;
+	if (!md5db_write1(db, z, z0, &st0, k, e, err))
+	    return false;
+    }
+    // Append what's left.
+    for (; i < db->lend; i++)
+	if (!md5db_write1(db, z, z0, &st0, strtab + kk[i], &db->ee[i], err))
+	    return false;
+    for (; j < db->aend; j++)
+	if (!md5db_write1(db, z, z0, &st0, strtab + kk[j], &db->ee[j], err))
+	    return false;
+    // TODO: append the rest of z0.
+    return true;
 }
 
 #include <stdlib.h>

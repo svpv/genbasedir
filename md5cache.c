@@ -206,6 +206,23 @@ static bool md5db_readall(struct md5db *db, int fd, const char *err[2])
     return ok;
 }
 
+static struct entv *md5db_find(struct md5db *db, const char *key)
+{
+    size_t l = 0, u = db->lend;
+    unsigned *kk = db->kk;
+    while (l < u) {
+	size_t i = (l + u) / 2;
+	int cmp = strcmp(strtab + kk[i], key);
+	if (cmp < 0)
+	    l = i + 1;
+	else if (cmp > 0)
+	    u = i;
+	else
+	    return &db->ee[i];
+    }
+    return NULL;
+}
+
 #include <stdlib.h>
 #include <limits.h>
 #include <sys/stat.h>

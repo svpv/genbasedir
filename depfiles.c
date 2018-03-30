@@ -53,18 +53,13 @@ static inline bool bindir(const char *d, size_t dlen)
 
 #include <assert.h>
 #include <rpm/rpmlib.h>
+#include <t1ha.h>
 #include "fpset.h"
-#include "t1ha.h"
 
 // The hash function which is used for fingerprinting.
-// I wasn't able to compile the ifunc variant with AES-NI just yet.
 static uint64_t hash64(const void *data, size_t size, uint64_t seed)
 {
-#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-    return t1ha1_be(data, size, seed);
-#else
-    return t1ha1_le(data, size, seed);
-#endif
+    return t1ha0(data, size, seed);
 }
 
 // The seed used for fingerprinting, initialized later with a random

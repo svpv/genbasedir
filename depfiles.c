@@ -89,7 +89,7 @@ static void addDepFile(const char *dep, size_t len)
     // Skip if it's under bindir; later the check for bindir will
     // pick it up anyway.  This fpset data structure works best when
     // it has the fewest elements.
-    const char *rslash = strrchr(dep, '/');
+    const char *rslash = memrchr(dep, '/', len);
     size_t dlen = rslash + 1 - dep; // including the slash
     if (bindir(dep, dlen))
 	return;
